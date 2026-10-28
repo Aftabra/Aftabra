@@ -1142,3 +1142,90 @@ For the record, everything I have had to revise during this engagement:
 4. **Better Auth admin POST routes** - a GET returning an empty-body 404 is a
    method mismatch, not proof the route is absent. Stated in 15.6; repeated here
    because it is easy to misread as "those endpoints don't exist".
+
+---
+
+# 19. Legal documents, and the end of unauthenticated collection
+
+## 19.1 What `/privacy` and `/terms` gave up
+
+**No sub-processors are named in either document.** Both defer to the trust
+centre: "The names and locations of all current Sub-Processors ... are set forth
+in our trust center at trust.lithicblue.com." That page is rendered client-side by
+Vanta, so its contents were not retrievable here.
+
+**Remaining collection gap:** open `trust.lithicblue.com` in a real browser and
+read the sub-processor list. Every entry is a third party in the data path - which
+AI providers, which hosting, which storage - and that list is the last piece of
+infrastructure inventory not yet recovered. It also tells you whether the AI
+providers are reached directly or via a gateway, which matters for the
+prompt-injection and research-agent work.
+
+Useful facts extracted:
+
+- **The entity is "LithicBlue Pty Ltd"** - an Australian company. Consistent with
+  the Oceania region and the Australian-government use case. Relevant to the
+  jurisdictional notes in their reward terms.
+- **MSA:** "Where LithicBlue engages Sub-Processors to process Service Data, it
+  will do so **consistent with the Customer's assigned region**."
+- **MSA:** "Services **exclude any products or services provided by third
+  parties**, even if Customer has connected those products or services to the
+  Services." Relevant to the Drive/SharePoint scope question in 17.3 - their
+  contract draws the line at the connected system's boundary, which supports
+  testing *LithicBlue's* handling of delegated access while leaving the
+  customer's Workspace or tenant itself outside.
+- Authentication providers are acknowledged as third-party data sources ("single
+  sign-on and authentication providers you use to access the Services"), and
+  customers "may provision accounts for their authorized users" - so there is a
+  customer-provisioned account path worth asking about.
+
+**Not a finding:** the MSA commits sub-processors to the customer's assigned
+region, while `/docs/hosting/data-residency` states AI processing "runs across our
+global infrastructure by default ... and can be kept fully in-region on request."
+That reads as a documentation/contract inconsistency rather than a security
+vulnerability, and their criteria require a vulnerability. Don't report it. It is
+worth knowing only because it confirms a cross-region data pipeline exists by
+default, which is context for the cross-region tests.
+
+## 19.2 Unauthenticated collection is complete
+
+Stating this plainly so no more time goes into it. What was covered:
+
+| Avenue | Result |
+|---|---|
+| Passive subdomain enumeration | 7 sources; **provably bounded at 8 hosts** by 112 crt.sh certificate records |
+| DNS (A/CNAME/MX/TXT/CAA/NS/SOA/DMARC, over DoH) | complete; 16.4 |
+| Live-host probing | 7 of 8 respond; `auth` has no DNS record |
+| Crawl of all public pages | 67 pages, 120 JS URLs |
+| Current bundles | 78 downloaded and mined |
+| Chunk-graph walk for app bundles | no further public chunks reachable |
+| Source maps | **none** - production build disables them |
+| Historical bundles (Internet Archive) | 38 archived bundles recovered and mined; legacy routes, the `engagementId` rename, the Supabase client |
+| Archived removed pages | `/faq` recovered |
+| OAuth / OIDC discovery, all 3 regions | complete; 14 and section 14's hygiene table |
+| MCP protected-resource metadata | complete |
+| Better Auth route probing (GET only) | admin plugin confirmed enabled |
+| CSP, security headers | complete third-party inventory; 16.3 |
+| Cookies (unauthenticated) | `lb_region`, domain-wide; 16.2 |
+| S3 buckets | all three reject anonymous listing |
+| All published documentation | read |
+| Privacy policy, MSA | read; sub-processors deferred to trust centre |
+| Regional build comparison | same source, verified; 18.1 |
+
+**Everything remaining requires an account.** Not as a formality - the bugs this
+program pays for are cross-organisation access and within-organisation privilege
+escalation, both of which are authenticated by definition. No amount of further
+external collection substitutes for `/signup`.
+
+Next action is Part 1 of `RUNBOOK.md`: build the two organisations, then capture
+one authenticated tRPC call. That single request yields the procedure list, and
+with it the real surface for everything in sections 6-17.
+
+The two things to do before testing, both one email to security@lithicblue.com:
+
+1. Confirm whether the Supabase project and the S3 buckets are in scope (16.1).
+   Their criterion is LithicBlue **ownership**, with `*.lithicblue.com` given as
+   an example rather than a limit - but get it in writing, because that is where
+   the highest-severity findings most likely live.
+2. Ask whether they want an identifying header on research traffic, and confirm
+   manual testing with two self-provisioned organisations is acceptable.
