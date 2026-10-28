@@ -375,3 +375,214 @@ scopes                  openid profile email offline_access mcp:tools
 4. **O1 + O2** registration redirect validation plus silent auth, chained
 5. **O5 / W7** authorization surviving removal
 6. **R1 / R2** research-fetcher SSRF and allowlist bypass
+
+---
+
+# 15. Second pass - project roles, admin plugin, legacy build
+
+## 15.1 Project-level roles: a second permission dimension
+
+From `/docs/project-management/managing-team-members`. Project roles are
+**separate from organisation roles**, so every org role x project role pair is a
+distinct authorization state.
+
+| Project role | Stated capability |
+|---|---|
+| Owner | Everything: edit the project, manage access, **delete the project**. A project always has at least one owner. |
+| Admin | Everything a member can, plus manage access (add/remove/change roles) and update project settings. |
+| Member | Work on the project; sees the member list but **cannot edit it**. |
+
+Stated invariants:
+
+- **P1** "Owners and admins can make changes here; members see the list but can't
+  edit it." As a project Member, call add-member, remove-member and change-role.
+- **P2** "You add project members from people already in your organisation; you
+  can't invite a brand-new email straight onto a project." Call add-member with a
+  **user ID from your other organisation**. If the handler doesn't verify the
+  target is in your org, you can pull a foreign user into your project - or add
+  yourself to theirs. This is a direct cross-organisation path; test it both ways.
+- **P3** "You can't remove or demote the last owner." Call remove/demote on the
+  last owner via the API. An ownerless project is an integrity bug.
+- **P4** Project delete is owner-only. Call it as project Admin.
+- **P5** Cross-dimension: can an **org** Admin read a project they are not a
+  project member of? Can an org Member who is a project Owner reach org-level
+  settings? The docs keep the dimensions separate, so any leakage between them is
+  worth a question even if it turns out intended.
+
+## 15.2 Research controls - the personal/organisation merge
+
+From `/docs/organization/research-controls` and `/docs/account`:
+
+- Org setting lives in Settings -> Organization, **editable by owners and admins**,
+  applies to every member. Two modes: **Exclude domains** (blocklist) or
+  **Restrict to domains** (allowlist).
+- Personal **Preferences** have their *own* Web Search Settings, and the docs say
+  they are "**merged with your organization's settings**".
+- The stated rule: "If your organization restricts searches to an allow-list, you
+  can only disable specific domains to narrow your own results further. If your
+  organization doesn't restrict searches, you set your own Filter Mode."
+
+**R5 - merge-logic bypass.** This is the most promising item in this section. The
+documented behaviour is that a member may only ever *narrow*. Test, as a plain
+Member under an org allowlist:
+
+- set a personal Filter Mode of `Exclude domains` (which should be impossible
+  while the org restricts), and see whether the effective policy becomes a
+  blocklist;
+- add a domain to your personal allowlist that is **not** on the org allowlist;
+- submit both settings directly to the API rather than through the UI, which is
+  where the "you can only disable" constraint is likely enforced;
+- check whether the merge is a union (wrong) or an intersection (right).
+
+Widening the research agent's reach past an org policy is "circumvention of
+permission controls" verbatim from their threat model, and it is also the gateway
+to R1/R2 (SSRF) because it controls which hosts the fetcher will visit.
+
+**R6** Org setting is owner/admin-editable - confirm a Member cannot write it
+(ties to W4).
+
+## 15.3 Security-page claims worth attacking
+
+From `/docs/security`, each of these is a vendor security claim:
+
+- **S1 - "Each project is isolated, and access follows your existing permissions,
+  including the permissions on connected SharePoint or Google Drive folders, so
+  people only see what they could already open."** They propagate *third-party*
+  ACLs. Test: put a file in a connected Drive/SharePoint folder that user X
+  cannot open in Drive, then have X read it through LithicBlue. If the project
+  knowledge base, the ontological map, a claim citation or a generated deliverable
+  surfaces that content, the propagation is incomplete. Note the knowledge base is
+  built *across* a project's sources - so even if the file view is gated, extracted
+  passages may leak through search, claims or verification output. That indirection
+  is where this breaks in practice.
+- **S2 - Microsoft Purview sensitivity labels.** "A label that encrypts the
+  document means LithicBlue cannot read it, so it is marked as protected rather
+  than analysed. LithicBlue does not attempt to remove or work around that
+  protection." Test whether an encrypted-labelled document can be made to analyse
+  anyway - re-upload, rename, change container, submit via a different ingestion
+  path (direct upload vs Drive vs SharePoint vs MCP). Getting protected content
+  analysed contradicts a stated control.
+- **S3 - Password-protected documents** "are not read unless someone supplies the
+  password." Where does that password go? Is it stored, logged, or visible to
+  other project members? Can a Member retrieve a password an Owner supplied?
+- **S4** Encryption claims (AES-256 at rest, TLS 1.2+) are not remotely testable
+  beyond TLS configuration, and TLS config issues aren't in their reward criteria.
+
+## 15.4 Account surface
+
+From `/docs/account`:
+
+- **A1 - Email change.** You can update your email in Account Settings. Test:
+  does it require verification of the *new* address before taking effect? Does it
+  invalidate sessions? Then the interesting chain: change your email to match a
+  **pending invitation** at another organisation and accept it, or to a domain
+  that triggers any domain-based auto-join (C9). Unverified email change feeding an
+  invitation flow is a clean cross-org path.
+- **A2 - Phone field** - stored and rendered; check for stored XSS and for
+  whether it appears in other members' views.
+- **A3 - Password reset** clears the sign-in lockout "immediately, without
+  waiting". Check reset-token entropy, single use, expiry, and whether reset
+  invalidates existing sessions and outstanding MCP refresh tokens.
+- **Not reportable:** "Too many failed email-and-password sign-ins ... temporarily
+  pause email-and-password sign-in for it, **whoever the attempts came from**."
+  That is a documented account-lockout denial of service, and their exclusions bar
+  both DoS and login brute force. Don't report it.
+
+## 15.5 Legacy build (recovered from Internet Archive)
+
+The archived build is on the old `/_next/static/chunks/` path scheme, versus
+today's `/_next/static/immutable/chunks/`. 38 archived bundles were recovered and
+mined. What it exposed that the current public bundles do not:
+
+**The rename: `engagementId` -> `projectId`.** The old build routed
+`/kag/:engagementId` and `/view/:engagementId/:fileId`; today those are
+`:projectId`.
+
+- **L1** Test whether the API still accepts the legacy parameter name. Send
+  `engagementId` alongside or instead of `projectId` to tRPC procedures and route
+  handlers. Renames commonly leave a backward-compatible alias wired to an older
+  code path with weaker checks, and a legacy alias that skips the current
+  authorization middleware is a cross-org read.
+
+**An admin console**, referenced nowhere in the current public bundles:
+
+```
+/admin            /admin/users/        /admin/oauth/clients/
+/admin/custom-providers/               /admin/generate_link
+/project/_/settings/api                /organizations/
+```
+
+- `/admin` on `na` responds differently from a nonexistent path (a 307 carrying a
+  Next.js error document, versus the 48 KB 404 page), so the route exists.
+- `/admin/users`, `/api/demo/*`, `/api/broadcast`, `/project/_/settings/api` and
+  `/faq` all return the 48 KB 404 page on `na` now - **removed, dead ends.**
+- `/admin/oauth/clients` suggests OAuth clients registered through dynamic
+  registration are administered somewhere; `/admin/custom-providers` suggests
+  configurable SSO providers; `/admin/generate_link` suggests server-generated
+  sign-in links.
+
+## 15.6 Better Auth admin plugin is enabled - highest-value lead
+
+```
+GET /api/auth/admin/list-users   ->  401, empty body     (exists, gated)
+GET /api/auth/list-sessions      ->  401 {"code":"UNAUTHORIZED"}
+GET /api/auth/oauth2/userinfo    ->  401 {"error":"invalid_request"}
+nonexistent path                 ->  48 KB Next.js 404 page
+```
+
+`list-users` is a GET route in Better Auth's **admin plugin**, and it answers 401
+rather than the Next.js 404 page. The plugin is enabled.
+
+Caveat on method: the plugin's other routes (`impersonate-user`, `set-role`,
+`create-user`, `set-user-password`, `ban-user`, `remove-user`,
+`revoke-user-session`) are POST, and a GET to them returns Better Auth's own
+0-byte 404. That is a **method mismatch, not proof of absence** - their presence
+is unconfirmed, though an enabled plugin normally registers its full route set.
+These were deliberately not POSTed to; verifying them is manual work on your own
+account.
+
+**The escalation chain to test (E1).** Better Auth's admin plugin decides who is
+an admin from the user's **`role` field** by default, unless the app pins an
+explicit `adminUserIds` list. The recurring implementation mistake is letting the
+user-update path write `role`. So:
+
+1. As an ordinary user, attempt to set `role` on your own account - through the
+   account-update endpoint, through any profile mutation, and as an extra field on
+   unrelated update calls (mass assignment). Try `banned` and `emailVerified` too.
+2. If `role` becomes `admin`, call `admin/list-users` - it should now answer.
+3. If the plugin's full route set is registered, `admin/impersonate-user` gives a
+   session as **any user in any organisation**.
+
+That is member-to-admin escalation chaining into cross-organisation account
+takeover: both halves of their threat model, at the top reward tier. It is the
+single most promising lead from this engagement.
+
+Report it carefully: demonstrate on accounts you own, do not impersonate a real
+customer, and if you do land an admin session, stop and report rather than
+exploring. Their policy: "If you come across user data during the course of
+discovering vulnerabilities, please report it to us immediately, and do not store,
+copy, transfer, disclose, or otherwise retain this information."
+
+## 15.7 Not findings
+
+- **PostHog project key** `phc_Fqv8...` in the bundles - a publishable client-side
+  key, public by design.
+- **`www.lithicblue.com/9bb3665e28f2b230/script.js`** (200, ~12 KB) - a
+  first-party-proxied analytics script on a hashed path. Normal ad-blocker
+  avoidance, not a vulnerability.
+- `.well-known` documents - their exclusions explicitly bar disclosure of known
+  public resources.
+- `proxy.lithicblue.com` DNS misconfiguration - excluded operational issue.
+- Account lockout via failed sign-ins - excluded DoS, and self-documented.
+
+## 15.8 Revised priority order
+
+1. **E1** self-assign `role` -> admin plugin -> impersonation (15.6)
+2. **R5** research-controls personal/org merge bypass (15.2)
+3. **P2** add a cross-org user ID to a project (15.1)
+4. **O4** cross-region token and client acceptance (section 14)
+5. **W1** invite above your own role level (section 7)
+6. **M1** MCP tool object authorization with foreign IDs (section 8)
+7. **L1** legacy `engagementId` parameter alias (15.5)
+8. **S1** Drive/SharePoint ACL propagation into the knowledge base (15.3)
+9. **A1** unverified email change feeding the invitation flow (15.4)
