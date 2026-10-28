@@ -791,3 +791,244 @@ Reading it:
 9. **M1** MCP tool object authorization with foreign IDs (section 8)
 10. **L1** legacy `engagementId` parameter alias (15.5)
 11. **S1** Drive/SharePoint ACL propagation into the knowledge base (15.3)
+
+---
+
+# 17. Fourth pass - build drift, delegation, ingestion, the research trigger
+
+## 17.1 Attack surface is provably exhausted at 8 hosts
+
+crt.sh holds **112 certificate records** for `%.lithicblue.com`, covering exactly
+the eight hostnames already known. The other passive sources returned nothing for
+benign reasons (HackerTarget quota exceeded, Anubis 301, OTX anonymous rate limit,
+RapidDNS empty, subdomain.center two names). There is no ninth host to find.
+
+The certificate timeline is more useful than the names:
+
+| Host | Certs | First | Last | Reading |
+|---|---|---|---|---|
+| `lithicblue.com` | 85 | 2025-08-05 | 2026-08-18 | site live ~Aug 2025 |
+| `www` | 14 | 2025-08-05 | 2026-08-12 | |
+| `proxy` | 19 | 2025-11-13 | **2026-03-14** | decommissioned ~Mar 2026 |
+| `auth` | 12 | 2025-12-12 | **2026-06-07** | decommissioned ~Jun 2026 |
+| `na` / `eu` / `au` | 4 each | **2026-06-15** | 2026-08-16 | **regions created Jun 2026** |
+
+**The architecture changed in June 2026**: a centralised `auth.lithicblue.com`
+stopped renewing on 2026-06-07 and the three regional hosts appeared on
+2026-06-15. The bundles still carry `NEXT_PUBLIC_AUTH_URL` and
+`NEXT_PUBLIC_BETTER_AUTH_URL` - leftovers from that era.
+
+**Why this matters for hunting.** The entire multi-region, per-region-issuer
+authorization model is roughly four months old. It is the newest code in the
+product and has had the fewest eyes on it. Every cross-region item (O4, RC1, C5,
+M6) is aimed at code written in the last quarter. `proxy`'s broken Cloudflare-loop
+record is a leftover from the same migration.
+
+## 17.2 The regions run different builds - a fix in one may not be in another
+
+Deployment IDs from `/login`:
+
+```
+na   dpl_FQ6MTJaUgkFGikVPtzRKUJvTdVpS
+eu   dpl_48D46hhDDpodFKXXRss3sKCLoQ7U
+au   dpl_H38RUcTopDhSugXUVSYm5FTvYQ4w
+www  dpl_48D46hhDDpodFKXXRss3sKCLoQ7U    <- identical to eu
+```
+
+All three serve 23 chunks on the login page, but **10 chunk names differ between
+every pair**. Three separate Vercel deployments carrying different code.
+
+**BD1 - Deployment drift.** The regions are not in lockstep, so:
+- When you find and report a bug, **check the other two regions** before you
+  write it up. "Present on `na` and `au`, fixed on `eu`" is useful intelligence
+  for them and strengthens your report.
+- After they remediate, re-test the other regions. A fix deployed to one region
+  only is a legitimate follow-up finding, not a duplicate.
+- Whichever region carries the oldest code is the most likely to still hold an
+  already-fixed defect. Track the `dpl_` IDs over time to see which lags.
+
+**BD2 - `www` is the EU deployment.** Note the conflict in evidence, and resolve
+it before relying on either: `www`'s `/login` reports the **EU** deployment ID,
+while `www`'s `/landing` served a CSP naming the **AU** S3 bucket, with
+`x-vercel-cache: HIT` and `x-nextjs-prerender: 1`. The most likely explanation is
+a **stale prerendered page cached from an earlier deployment**, still being served
+with that older deployment's CSP. Worth confirming: a cached page surviving a
+deployment can mean stale JavaScript, stale CSP, or stale embedded configuration
+served to users. Check whether any cached page references config that has since
+rotated.
+
+## 17.3 Google Drive uses domain-wide delegation - the highest-privilege surface
+
+From `/docs/google-drive`:
+
+> "LithicBlue connects to your Google Workspace through a **service account with
+> domain-wide delegation**. Your Workspace administrator authorises the connection
+> once for the whole organisation... Access always respects your existing Drive
+> permissions, so each person only sees the files they can already open."
+
+Understand what that means. Domain-wide delegation lets the service account
+**impersonate any user in the customer's entire Google Workspace**. Google is not
+enforcing per-user access here - LithicBlue holds a key that opens everything, and
+*LithicBlue's own code* decides which user to impersonate for each request. The
+sentence "each person only sees the files they can already open" is therefore an
+application-level promise, not a platform guarantee.
+
+**DWD1 - Impersonation subject control.** Find where the backend decides whose
+identity to use when fetching a Drive file. If that subject is derived from
+anything client-influenced - a user ID, an email, a member record, a project
+membership row - try substituting another user's. Success means reading any file
+any user in that Workspace can see. That is the highest-impact bug available in
+this product, because it reaches beyond LithicBlue into the customer's whole Drive.
+**DWD2 - Connection record binding.** The delegation is authorised per
+organisation. If connection or drive records are addressed by ID without
+validating they belong to *your* organisation, an Org B user could drive Org A's
+delegated service account. Test with your two orgs.
+**DWD3 - Who may connect.** "Step 1 must be done by a Google Workspace super
+administrator... **Step 2 can be done by any LithicBlue user** who signed in with
+their Google account." So a non-admin can attach Shared Drives once delegation
+exists. Check whether a plain **Member** can connect a drive, and whether that
+drive then becomes visible to projects they don't belong to.
+**DWD4 - Identity gating.** "Drive settings are only available to Google-identity
+users." Test whether an email/password account can reach those endpoints directly,
+bypassing a UI-only check.
+**DWD5 - SharePoint equivalent.** `/docs/sharepoint`: Microsoft Graph with
+**tenant administrator consent** granted org-wide, then "Step 2 can be done by a
+project member with access to the site." Graph application permissions granted by
+admin consent are typically tenant-wide, so the same analysis applies: LithicBlue
+enforces the per-user ACL itself. Run DWD1-DWD4 against SharePoint too.
+
+Report these with care. A successful test here reads a real customer's documents,
+so confine it strictly to Workspace/tenant accounts **you** control, connected to
+organisations **you** created.
+
+## 17.4 Ingestion surface - very wide, and HTML is accepted
+
+From `/docs/project-management/managing-files`, accepted source types:
+
+> PDF, Word (.docx), PowerPoint (.pptx), Excel (.xlsx) **including their
+> macro-enabled and template versions**, **Visio**, CSV, TSV, TXT, MD, **HTML**,
+> **emails**, meeting transcripts (**.vtt, .srt**), images "and more".
+
+- **ING1 - HTML as a source document.** The standout. If source HTML is ever
+  rendered - in a preview, a claim citation, an excerpt, the file viewer - that is
+  stored XSS, and `script-src 'unsafe-inline'` (16.3) means CSP will not contain
+  it. Check every place a passage is displayed, not just the file view.
+- **ING2 - OOXML containers.** `.docm`/`.xlsm`/`.pptm`/templates plus `.vsdx`
+  (Visio is an unusual, rarely-audited parser). Test XXE in the OOXML XML parts and
+  zip path traversal in the container. Keep it to correctness - DoS is excluded.
+- **ING3 - Email parsing.** `.eml` MIME and `.msg` (OLE compound file) are complex
+  formats. Also check whether an email's embedded remote content gets fetched
+  during ingestion - that is an SSRF path on upload.
+- **ING4 - Images.** Images implies OCR, which implies an image-decoding library.
+  Malformed-image handling is worth a look.
+- **ING5 - Quick Start scope extraction.** `/docs/project-management/setting-scope`:
+  "LithicBlue extracts an initial scope from the proposal or scope-of-work document
+  you upload." That is a *second, distinct* parsing pipeline on upload. Separate
+  code path, separate bugs.
+- **ING6 - Folders and cloud sync.** Mirrored folder structures mean
+  server-side path construction from names you control in Drive/SharePoint. Try
+  traversal sequences and absolute paths in folder and file names.
+- **ING7 - Source/deliverable state machine.** "Each file is a source, a
+  deliverable or ignored (a distinction you set, not one baked into the file)" and
+  "a document can't be both". A mutable type attribute with an exclusivity rule is
+  a state machine. Try flipping a file's role mid-verification, or forcing both
+  states, to see whether review logic can be bypassed or confused.
+
+## 17.5 The research agent's trigger - a complete SSRF/bypass PoC chain
+
+`/docs/project-management/data-gaps` gives the missing piece: the web research
+agent is invoked from the **Data Gaps tab** via **Run Research** / **Re-run
+Research**. That is the entry point for the research-controls work in 15.2 and R1/R2.
+
+So the full chain is now testable end to end, with **out-of-band confirmation**,
+which makes for an unambiguous report:
+
+1. As Org A owner, set Research Controls to **Restrict to domains** with a single
+   harmless entry (e.g. `example.com`). Save.
+2. As a plain **Member**, open Preferences and attempt to widen the policy -
+   switch Filter Mode to **Exclude domains**, or add a domain absent from the org
+   allowlist. Submit directly to the API, not through the UI, since the
+   "you can only disable" constraint is most likely enforced client-side.
+3. Trigger **Run Research** on a project's Data Gaps tab.
+4. Watch a domain **you control** (your own server, or a Burp Collaborator
+   payload). A request arriving there proves the org policy was circumvented -
+   no guesswork, no reliance on rendered output.
+5. Then escalate the target: internal addresses, `169.254.169.254`, `localhost`,
+   RFC1918, and allowlist-bypass tricks (open redirect on an allowed host, DNS
+   rebinding, `@`/`#`/encoded-host parser confusion, trailing dots).
+
+Steps 1-4 alone are "circumvention of permission controls", verbatim from their
+threat model. Step 5 turns it into SSRF. DoS is excluded, so keep request volume
+to a minimum - one confirmed callback is the whole proof.
+
+## 17.6 Integrity surfaces - their threat model covers integrity too
+
+Their criteria say "substantially affect the **confidentiality or integrity** of
+user data", and these deliverables are client-facing advisory documents where a
+false "verified" verdict is the damage.
+
+- **INT1 - Claim verdict tampering.** `/docs/document-review/managing-findings`:
+  "Edit…: change the verdict, rewrite the reasoning, or add and remove sources."
+  Verdicts are mutable. Test who may edit them - a project Member, an org Member
+  not on the project, someone in another org, and an MCP token via `write_claims`.
+  Flipping a contradicted claim to verified in someone else's deliverable is a
+  clean integrity finding.
+- **INT2 - Contradiction override.** `/docs/project-management/contradictions`:
+  LithicBlue picks a winner between conflicting claims and the user may Validate
+  or Override. Test authorization on the override action. Changing which of two
+  conflicting figures a client report asserts is material.
+- **INT3 - CSV formula injection.** The claims panel exports to CSV ("one row per
+  claim or one row per source"). Claim text derives from **uploaded documents**,
+  which are attacker-controlled. If a cell beginning `=`, `+`, `-` or `@` is not
+  neutralised, that is formula injection executing in the reviewer's spreadsheet.
+  Not in their exclusion list. Frame impact as code execution in the context of
+  the person reviewing the deliverable, plus exfiltration of the sheet's contents.
+- **INT4 - Knowledge-base poisoning.** The ontological map "resolves the conflict
+  before the information is ever used". A crafted source that reliably wins
+  conflict resolution poisons the resolved picture every later answer draws on.
+  Within your own project this is low impact; it becomes a finding where the
+  source arrives from a shared cloud-synced folder or any path a lower-privileged
+  or external party can write to, and it then alters what other members see.
+- **INT5 - Emailed deliverable links.** `/docs/project-management/creating-a-project`:
+  the first-run flow emails you "a link straight to your deliverable". Examine that
+  URL: is it a guessable ID or a token? What entropy? Does it work unauthenticated,
+  after you leave the org, or for a different account? Emailed deep links routinely
+  carry weaker authorization than the app they point into.
+
+## 17.6a Self-serve onboarding makes all of this reachable
+
+The first-run flow takes an uploaded `.pdf`/`.pptx`/`.docx` deliverable plus
+sources and **creates the project for you**, then emails results. So a fresh
+signup reaches the document pipeline, the claim engine and the deliverable viewer
+within one session - no sales call needed. Only the MCP connector needs a paid plan.
+
+## 17.7 Additional non-findings
+
+- `www.lithicblue.com/9bb3665e28f2b230/script.js` is **Vercel Speed Insights**
+  proxied on a hashed path (`first-contentful-paint`, `largest-contentful-paint`,
+  `layout-shift`, `data-sdkv`), matching `va.vercel-scripts.com` in the CSP. No
+  configuration, no keys. Not a finding.
+- The archived `/faq` page (removed from the live site) independently confirms the
+  rename: "You create an **engagement**, upload the source materials". Useful
+  corroboration for L1, not a finding in itself.
+- `/articles` holds four marketing posts, no engineering detail.
+
+## 17.8 Final priority order
+
+Confidentiality, highest reward first:
+
+1. **SB1-SB3** Supabase RLS - reads, writes, Realtime (16.1). Confirm scope by email first.
+2. **DWD1/DWD2** Drive domain-wide-delegation impersonation and connection binding (17.3)
+3. **E1** self-assign `role` -> admin plugin -> impersonation (15.6)
+4. **RC1/RC2** `lb_region` tampering; session cookie domain scope incl. Vanta (16.2)
+5. **R5 + 17.5** research-controls merge bypass, confirmed out-of-band, then SSRF
+6. **P2** project add-member with a cross-organisation user ID (15.1)
+7. **O4** cross-region OAuth token/client acceptance (section 14) - newest code in the product
+8. **M1** MCP tool object authorization with foreign IDs (section 8)
+9. **W1** invite above your own role level (section 7)
+10. **INT5** emailed deliverable link authorization (17.6)
+11. **ING1** HTML source rendering -> stored XSS, amplified by `unsafe-inline` (17.4)
+12. **L1** legacy `engagementId` parameter alias (15.5)
+
+And on every confirmed finding: **re-test the other two regions** (BD1). The
+builds differ, so scope is per-region until proven otherwise.
