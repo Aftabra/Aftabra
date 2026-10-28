@@ -272,17 +272,86 @@ def cmd_subs(args, scope):
 # --------------------------------------------------------------------------
 TITLE_RE = re.compile(rb"<title[^>]*>(.*?)</title>", re.I | re.S)
 
+# CDN / hosting edges. A CNAME here usually still fronts the target's OWN app,
+# so these are informational only and still get probed.
+CDN_SUFFIXES = (
+    ".cloudfront.net", ".akamaiedge.net", ".akamai.net", ".edgekey.net",
+    ".edgesuite.net", ".fastly.net", ".fastlylb.net", ".cloudflare.net",
+    ".cdn.cloudflare.net", ".azureedge.net", ".trafficmanager.net",
+    ".elb.amazonaws.com", ".awsglobalaccelerator.com", ".cdn77.org",
+    ".stackpathdns.com", ".impervadns.net", ".incapdns.net",
+)
+
+# Third-party SaaS products. A CNAME here means the host IS a third-party
+# service, which Lithero's terms section 1 puts outside the program.
+SAAS_SUFFIXES = (
+    ".herokuapp.com", ".github.io", ".netlify.app", ".vercel.app",
+    ".pages.dev", ".workers.dev", ".surge.sh", ".appspot.com",
+    ".azurewebsites.net", ".firebaseapp.com", ".web.app",
+    ".zendesk.com", ".freshdesk.com", ".desk.com", ".intercom.io",
+    ".helpscoutdocs.com", ".helpjuice.com", ".uservoice.com",
+    ".statuspage.io", ".status.io", ".betteruptime.com",
+    ".hubspot.com", ".hs-sites.com", ".marketo.com", ".mktoweb.com",
+    ".pardot.com", ".unbounce.com", ".instapage.com", ".launchrock.com",
+    ".squarespace.com", ".wixdns.net", ".wordpress.com", ".webflow.io",
+    ".pantheonsite.io", ".acquia-sites.com", ".wpengine.com", ".kinsta.cloud",
+    ".myshopify.com", ".shopify.com", ".bigcommerce.com",
+    ".salesforce.com", ".force.com", ".atlassian.net", ".jira.com",
+    ".bitbucket.io", ".readthedocs.io", ".gitbook.io", ".discourse.group",
+    ".sendgrid.net", ".mailgun.org", ".mandrillapp.com", ".createsend.com",
+    ".campaignmonitor.com", ".cmail19.com", ".typeform.com", ".tfaforms.net",
+    ".canny.io", ".productboard.com", ".frontify.com", ".olark.com",
+    ".brightcove.com", ".wistia.com", ".jwplayer.com", ".optimizely.com",
+    ".zohohost.com", ".tealiumiq.com",
+)
+
+
+def classify(host):
+    """-> (ip, cname_chain, kind) where kind is 'self' | 'cdn' | 'third-party'."""
+    try:
+        canon, aliases, ips = socket.gethostbyname_ex(host)
+    except Exception:
+        return None, [], "dead"
+    chain = [c.lower().rstrip(".") for c in ([canon] + list(aliases)) if c]
+    chain = [c for c in dict.fromkeys(chain) if c != host.lower()]
+    blob = " ".join(chain + [canon.lower()])
+    for suf in SAAS_SUFFIXES:
+        if suf in blob:
+            return (ips[0] if ips else None), chain, "third-party"
+    for suf in CDN_SUFFIXES:
+        if suf in blob:
+            return (ips[0] if ips else None), chain, "cdn"
+    return (ips[0] if ips else None), chain, "self"
+
 
 def cmd_probe(args, scope, hosts=None):
     hosts = hosts or read_lines(args.hosts)
     hosts = [h for h in hosts if scope.allows(h)]
     limiter = Limiter(args.rps)
 
+    # DNS-only pass first. Costs the target nothing and tells us which hosts are
+    # actually third-party services before we send them a single request.
+    log(f"resolving {len(hosts)} host(s) (DNS only, no traffic to target)...")
+    resolved = pool(hosts, lambda h: (h,) + classify(h), args.workers)
+    live_dns = [r for r in resolved if r[3] != "dead"]
+    third = [r for r in live_dns if r[3] == "third-party"]
+    probe_set = live_dns if args.probe_third_party else [r for r in live_dns
+                                                        if r[3] != "third-party"]
+
+    write_lines(os.path.join(args.out, "third-party-subdomains.txt"),
+                [f'{h}  ->  {",".join(c) or "?"}' for h, _ip, c, _k in third])
+    if third:
+        warn(f"{len(third)} host(s) resolve to third-party SaaS - "
+             + ("probing anyway (--probe-third-party)" if args.probe_third_party
+                else "NOT probed, see third-party-subdomains.txt")
+             + " [Lithero terms s1 excludes third-party services]")
+        for h, _ip, c, _k in third[:15]:
+            warn(f'  {h} -> {",".join(c)}')
+
+    meta = {h: (ip, chain, kind) for h, ip, chain, kind in live_dns}
+
     def one(host):
-        try:
-            ip = socket.gethostbyname(host)
-        except Exception:
-            return None
+        ip, chain, kind = meta[host]
         for scheme in ("https", "http"):
             r = http_get(f"{scheme}://{host}/", args.ua, hdrs(args),
                          timeout=args.timeout, limiter=limiter, insecure=args.insecure)
@@ -290,23 +359,26 @@ def cmd_probe(args, scope, hosts=None):
                 m = TITLE_RE.search(r["body"] or b"")
                 title = (m.group(1).decode("utf-8", "replace").strip()[:120]
                          .replace("\n", " ") if m else "")
-                return {"host": host, "ip": ip, "scheme": scheme,
-                        "status": r["status"], "final_url": r["url"],
+                return {"host": host, "ip": ip, "cname": chain, "kind": kind,
+                        "scheme": scheme, "status": r["status"],
+                        "final_url": r["url"],
                         "server": r["headers"].get("server", ""),
                         "title": re.sub(r"\s+", " ", title)}
-        return {"host": host, "ip": ip, "scheme": None, "status": None,
-                "final_url": "", "server": "", "title": ""}
+        return {"host": host, "ip": ip, "cname": chain, "kind": kind,
+                "scheme": None, "status": None, "final_url": "",
+                "server": "", "title": ""}
 
-    rows = pool(hosts, one, args.workers)
-    alive = [r for r in rows if r["status"]]
-    alive.sort(key=lambda r: r["host"])
+    rows = pool([h for h, _i, _c, _k in probe_set], one, args.workers)
+    alive = sorted([r for r in rows if r["status"]], key=lambda r: r["host"])
     write_json(os.path.join(args.out, "probe.json"), alive)
-    write_lines(os.path.join(args.out, "alive.txt"),
-                [r["final_url"] or f'{r["scheme"]}://{r["host"]}/' for r in alive])
-    log(f"probed {len(hosts)} host(s) -> {len(alive)} alive")
+    urls = [r["final_url"] or f'{r["scheme"]}://{r["host"]}/' for r in alive]
+    write_lines(os.path.join(args.out, "alive.txt"), urls)
+    log(f"{len(hosts)} in-scope name(s) -> {len(live_dns)} resolve -> "
+        f"{len(probe_set)} probed -> {len(alive)} alive")
     for r in alive[:60]:
-        log(f'  {r["status"]} {r["final_url"]:<60} {r["title"][:50]}')
-    return [r["final_url"] or f'{r["scheme"]}://{r["host"]}/' for r in alive]
+        tag = "" if r["kind"] == "self" else f' [{r["kind"]}]'
+        log(f'  {r["status"]} {r["final_url"]:<58}{tag} {r["title"][:46]}')
+    return urls
 
 
 # --------------------------------------------------------------------------
@@ -627,6 +699,9 @@ def main():
     ap.add_argument("--workers", type=int, default=10, help="concurrency (default 10)")
     ap.add_argument("--timeout", type=int, default=20)
     ap.add_argument("--insecure", action="store_true", help="skip TLS verification")
+    ap.add_argument("--probe-third-party", action="store_true",
+                    help="also probe hosts that CNAME to third-party SaaS "
+                         "(Lithero terms s1 excludes third-party services)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("subs", help="passive subdomain enumeration")

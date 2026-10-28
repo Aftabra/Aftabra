@@ -1,0 +1,20 @@
+{
+  "_comment": [
+    "Lithero working scope - WILDCARD ENABLED at the hunter's direction.",
+    "",
+    "The published terms do not enumerate assets and carry no safe harbor, so",
+    "this breadth is a judgement call, not something the policy grants. See",
+    "POLICY-NOTES.md. scope.conservative.json is the cautious alternative.",
+    "",
+    "Terms section 1 excludes third-party services. recon.py resolves every",
+    "name's CNAME before sending it any request: hosts pointing at SaaS",
+    "products are written to out/third-party-subdomains.txt and skipped unless",
+    "--probe-third-party is passed. CDN edges (CloudFront, Akamai, Fastly)",
+    "are treated as the target's own app and probed normally."
+  ],
+  "in_scope": [
+    "lithero.com",
+    "*.lithero.com"
+  ],
+  "out_of_scope": []
+}
