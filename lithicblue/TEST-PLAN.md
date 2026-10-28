@@ -254,3 +254,124 @@ attacker**.
 - Include a video or screenshots, exact repro steps, and an explicit impact
   statement in their terms: whose data, how much, from what starting position.
 - Rewards are paid after remediation in production.
+
+---
+
+# 13. Recon results (2026-10-28)
+
+**No vulnerabilities were found or confirmed.** This is attack-surface mapping only,
+gathered from passive sources, published documentation, public client bundles and
+public OAuth discovery documents. Everything in sections 6-10 remains a hypothesis
+for manual testing.
+
+## Hosts
+
+| Host | State |
+|---|---|
+| `www` / apex | Next.js marketing site; `/` redirects to `/landing` |
+| `na` / `eu` / `au` | **All three regions live**, each with its own build and its own OAuth issuer |
+| `auth.lithicblue.com` | In certificate transparency logs but **does not serve**. The bundles reference `NEXT_PUBLIC_AUTH_URL` / `NEXT_PUBLIC_BETTER_AUTH_URL`, so an auth host is configured somewhere |
+| `trust.lithicblue.com` | Trust Center |
+| `proxy.lithicblue.com` | Cloudflare returns "DNS points to prohibited IP" - the record points at a reserved/private address. Reads as an excluded operational misconfiguration; do not lead with it |
+
+## Dead ends - don't spend time here
+
+- **No source maps.** Production Next.js build with `productionBrowserSourceMaps`
+  off. No original sources to recover.
+- **No `/api/` application routes in public bundles.** Only PostHog's own
+  (`/api/surveys/`, `/api/early_access_features/`, `/api/web_experiments/`,
+  `/api/product_tours/`) plus `/api/auth` and `/api/trpc`. The tRPC procedure
+  names live in the authenticated bundles, so you need an account to enumerate them.
+- **Internet Archive was offline** when this ran, so historical bundles were not
+  retrievable. Retry later - old builds are the best source of removed endpoints
+  and legacy logic.
+- **No secrets** in any public bundle.
+
+## Confirmed stack details
+
+- Better Auth with the **organization plugin** and the **OIDC provider plugin**
+- tRPC at `/api/trpc`, with `trpc-accept` header handling (batching/streaming)
+- PostHog drives **feature flags** (`featureFlags`, `feature_flag_payloads`,
+  `early_access_features`). Flags gate app behaviour, so unreleased features are
+  flag-controlled - a legitimate avenue for finding surface that isn't shipped yet
+- Sentry for error reporting; Vercel hosting
+
+# 14. OAuth / OIDC provider - the concrete surface
+
+Public discovery, identical shape on all three regions (example: `na`):
+
+```
+issuer                  https://na.lithicblue.com/api/auth
+authorization_endpoint  .../api/auth/oauth2/authorize
+token_endpoint          .../api/auth/oauth2/token
+registration_endpoint   .../api/auth/oauth2/register     <- open dynamic registration
+userinfo_endpoint       .../api/auth/oauth2/userinfo
+introspection_endpoint  .../api/auth/oauth2/introspect
+revocation_endpoint     .../api/auth/oauth2/revoke
+end_session_endpoint    .../api/auth/oauth2/end-session
+jwks_uri                .../api/auth/jwks                (single RSA RS256 key)
+scopes                  openid profile email offline_access mcp:tools
+```
+
+`/api/mcp/mcp` unauthenticated returns a JSON-RPC error plus
+`WWW-Authenticate: Bearer resource_metadata="..."` - correct RFC 9728 behaviour.
+
+## Already solid - do not report these
+
+| Property | Value | Why it closes an attack |
+|---|---|---|
+| `code_challenge_methods_supported` | `["S256"]` only | No `plain` PKCE downgrade |
+| `response_types_supported` | `["code"]` | No implicit flow |
+| `grant_types_supported` | `authorization_code`, `refresh_token` | No password or implicit grant |
+| `authorization_response_iss_parameter_supported` | `true` | RFC 9207, blocks mix-up attacks |
+| `request_uri_parameter_supported` | `false` | **No SSRF via request objects** |
+| `request_parameter_supported` | `false` | No JAR parsing surface |
+| introspection / revocation auth methods | exclude `none` | Can't introspect others' tokens anonymously |
+
+## Live test targets (manual, your own accounts only)
+
+- **O1 - Dynamic client registration.** `token_endpoint_auth_methods_supported`
+  includes `none`, so public clients are allowed - correct for MCP, but it means
+  anyone can register a client. Test `redirect_uri` validation **at registration
+  and again at authorization**: wildcards, path traversal within an allowed
+  origin, `localhost` with arbitrary ports, scheme switches, multiple URIs where
+  only the first is checked. The attack to prove: register a client with a
+  redirect you control, get a victim to approve it, capture the code. PKCE S256
+  and the consent screen are the mitigations - verify both actually hold.
+- **O2 - `prompt=none` silent authentication.** `prompt_values_supported`
+  includes `none`. Test whether an already-authenticated victim yields a code to
+  a registered client with no interaction. Combined with any weakness in O1 this
+  removes the user from the loop entirely - that's the difference between a
+  medium and a high.
+- **O3 - `claims` parameter.** `claims_parameter_supported: true`. Try requesting
+  claims beyond the granted scope (e.g. `email` with only `openid`) and check
+  whether `userinfo` and the ID token honour scope boundaries.
+- **O4 - Cross-region token acceptance.** Three independent issuers with identical
+  path structure. Obtain a token at `eu`, present it to `na`'s and `au`'s
+  `/api/mcp/mcp`. Register a client at one region, try its `client_id` at another.
+  A correct implementation rejects on `iss`/`aud`. This is the single most
+  promising item here: it is cross-organisation *and* cross-region, it maps to
+  their top reward tier, and almost nobody tests it.
+- **O5 - Logout and revocation actually revoking.** `backchannel_logout_supported`
+  is true. After sign-out, after `/revoke-other-sessions`, and after a member is
+  **removed from the organisation**, check whether existing MCP access tokens and
+  refresh tokens still work. `offline_access` means long-lived refresh tokens
+  exist. Stale authorization after removal is a clean, demonstrable finding and
+  ties to W7.
+- **O6 - Scope fidelity on the MCP resource.** The resource advertises only
+  `mcp:tools`. Check whether a token lacking that scope is accepted anyway, and
+  whether an org **Member**'s token can call the write tools (`write_claims`,
+  `add_feedback_comment`, `request_feedback`).
+- **O7 - `acr_values_supported: ["0"]`** - no step-up authentication signalling.
+  Not a finding by itself; relevant if you find a sensitive operation that ought
+  to require re-authentication (ownership transfer, region change, integration
+  disconnect) and doesn't.
+
+## Priority order
+
+1. **O4** cross-region token acceptance - top reward tier, least contested
+2. **W1** invite above your own role level - highest probability of landing
+3. **M1** MCP tool object authorization with foreign project IDs
+4. **O1 + O2** registration redirect validation plus silent auth, chained
+5. **O5 / W7** authorization surviving removal
+6. **R1 / R2** research-fetcher SSRF and allowlist bypass
