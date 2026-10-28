@@ -1,0 +1,20 @@
+{
+  "_comment": [
+    "CONSERVATIVE scope for Lithero. Copy to scope.json only after the security",
+    "team confirms assets in writing - their published terms define NO scope.",
+    "",
+    "Deliberately NOT included: '*.lithero.com'. The terms never grant wildcard",
+    "authorization, and §1 excludes third-party services, which enumeration will",
+    "surface as SaaS-hosted subdomains.",
+    "",
+    "Before adding any host: resolve its CNAME. If it points at a SaaS vendor,",
+    "it is a third-party service and §1 puts it out of scope."
+  ],
+  "in_scope": [
+    "www.lithero.com",
+    "lithero.com"
+  ],
+  "out_of_scope": [
+    "*.lithero.com"
+  ]
+}
