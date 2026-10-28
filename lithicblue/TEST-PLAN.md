@@ -586,3 +586,208 @@ copy, transfer, disclose, or otherwise retain this information."
 7. **L1** legacy `engagementId` parameter alias (15.5)
 8. **S1** Drive/SharePoint ACL propagation into the knowledge base (15.3)
 9. **A1** unverified email change feeding the invitation flow (15.4)
+
+---
+
+# 16. Third pass - Supabase, CSP inventory, region cookie, DNS
+
+## 16.1 Supabase is in the data path - likely the single biggest surface
+
+The app's CSP on every page includes:
+
+```
+connect-src ... https://*.supabase.co https://*.supabase.in
+                wss://*.supabase.co  wss://*.supabase.in
+img-src     ... https://*.supabase.co https://*.supabase.in
+```
+
+`connect-src` plus `wss:` means the **browser talks directly to Supabase** - not
+only through their own API. Where a client speaks straight to Supabase, the
+authorization boundary is **Postgres Row Level Security**, not application code.
+
+An archived bundle carries the Supabase client (`supabaseUrl`, `supabaseKey`,
+`SupabaseAuthClient`) and an anon JWT whose payload decodes to:
+
+```json
+{"iss":"supabase","ref":"pcsyssamsygzgixvvxxc","role":"anon",
+ "iat":1745128470,"exp":2060704470}
+```
+
+Project ref **`pcsyssamsygzgixvvxxc`** -> `https://pcsyssamsygzgixvvxxc.supabase.co`.
+The anon key is **publishable by design and is not itself a finding** - Supabase
+intends it to ship in the client. What matters is what RLS permits when it is used.
+
+**Why this is the top lead alongside E1.** Missing or permissive RLS on a single
+table in a multi-tenant Supabase app means any holder of the anon key - or any
+authenticated user - reads rows belonging to every organisation. That is their
+highest-severity category stated verbatim: "access to information or resources in
+an arbitrary organization." It is also the most common serious defect in this
+exact stack.
+
+**SB1 - RLS coverage per table.** For each table the app touches, attempt a read
+with (a) the anon key alone and (b) an authenticated Org B session, using an Org A
+row. `select=*&limit=1` is enough; you never need volume.
+**SB2 - RLS on writes.** `POST`, `PATCH` and `DELETE` to another organisation's
+rows. Read-only RLS policies that forget write paths are common.
+**SB3 - Realtime.** `wss://` is permitted, so Realtime is in use. Realtime has its
+own authorization model and is frequently left open even where PostgREST is
+locked. Subscribe to table changes and see whether events for other organisations
+arrive. Very few people test this, and it leaks continuously rather than once.
+**SB4 - Storage buckets.** Supabase Storage has per-bucket policies separate from
+table RLS. Enumerate buckets and test object reads across organisations.
+**SB5 - Exposed schema.** Check whether the PostgREST root serves an OpenAPI
+document, and whether RPC functions (`/rest/v1/rpc/...`) are reachable.
+`SECURITY DEFINER` functions bypass RLS by design and are a classic escalation.
+**SB6 - Key confusion.** Confirm no `service_role` key ever reaches the client -
+in any bundle, any API response, any error payload. A leaked `service_role` key
+bypasses RLS entirely and would be critical.
+
+**I did not run any of these.** Two reasons, both deliberate:
+
+1. An RLS failure returns **real customer data on the first request** - and this
+   is confidential pharmaceutical, M&A and advisory material. Their policy is
+   explicit: "Never attempt to access anyone else's data", and if you do encounter
+   it, report immediately and retain nothing. There is no way to probe RLS
+   "lightly" when success means holding someone's deal documents.
+2. Their program excludes findings from automated or AI tooling, so a result I
+   produced would not be eligible anyway.
+
+So test these by hand, against **rows in organisations you created**, and the
+moment unfamiliar data appears: stop, screenshot only what proves the access
+control failed, redact it, and report.
+
+**Scope note worth settling first.** Their criterion is a "web service **owned by
+LithicBlue** that handles sensitive user data, *e.g.* properties hosted on
+`https://*.lithicblue.com`" - "e.g." reads as illustrative, not exhaustive, and
+their Supabase project and S3 buckets are LithicBlue-owned infrastructure holding
+customer data. But the hosts are `supabase.co` and `amazonaws.com`. Ask
+security@lithicblue.com to confirm these are in scope before testing them. One
+email removes the ambiguity, and the answer also tells you how they think about
+their own perimeter.
+
+## 16.2 `lb_region` - a client-controlled routing cookie, domain-wide
+
+Issued unauthenticated on first contact:
+
+```
+set-cookie: lb_region=na; Path=/; Domain=.lithicblue.com;
+            Secure; HttpOnly; SameSite=lax; Max-Age=31536000
+```
+
+Two properties matter.
+
+**RC1 - It selects a region and the client holds it.** If any backend path uses
+`lb_region` to decide which regional datastore to read, tampering with it is a
+cross-region data-access primitive. Authenticate at `na`, then replay requests
+with `lb_region=eu` and `lb_region=au`. Also try values the app never sets:
+unknown regions, empty, absurdly long, path traversal, SQL and template
+metacharacters - wherever this value lands (routing table, URL construction,
+connection string) decides what the bug is. A routing value a client controls is
+exactly the kind of thing that gets trusted deeper in the stack than intended.
+
+**RC2 - `Domain=.lithicblue.com` spans every subdomain.** This cookie is sent to
+`www`, `na`, `eu`, `au`, `proxy` **and `trust`**. Check what scope the *session*
+cookie uses once you authenticate:
+
+- If the session cookie is also `Domain=.lithicblue.com`, then a session minted at
+  `na` is transmitted automatically to `eu` and `au` - the browser performs the
+  cross-region test in RC1/O4 for you, and only server-side `iss`/`aud` validation
+  stands between regions.
+- Worse, `trust.lithicblue.com` is a **CNAME to `cname.vantatrust.com`** - a
+  third-party host. A domain-wide session cookie is therefore transmitted to
+  Vanta's infrastructure on every trust-centre request. `HttpOnly` stops script
+  access but not transmission. If the session cookie is domain-scoped, that is a
+  reportable session-token exposure to a third party; verify the exact `Domain`
+  attribute on the authenticated cookie before claiming it.
+
+## 16.3 CSP - complete third-party inventory
+
+Identical policy on all pages (bucket name varies by region). Full allowlist:
+
+| Directive | Notable origins |
+|---|---|
+| `script-src` | `'self' 'unsafe-inline'`, `*.lithicblue.com`, `*.posthog.com`, `*.i.posthog.com`, `va.vercel-scripts.com`, `apis.google.com`, `accounts.google.com` |
+| `connect-src` | `*.supabase.co/.in` + `wss://`, `*.posthog.com`, `vitals.vercel-insights.com`, `*.sentry.io`, `*.googleapis.com`, `accounts.google.com`, `lith-s3-bucket-<region>.s3.<aws-region>.amazonaws.com` |
+| `frame-src` | `*.sharepoint.com`, `*.sharepoint-df.com`, `*.officeapps.live.com`, `login.microsoftonline.com`, `docs.google.com`, `drive.google.com`, `content.googleapis.com`, `accounts.google.com` |
+| `form-action` | `'self'`, `*.sharepoint.com`, `*.sharepoint-df.com` |
+| `img-src` | `blob:`, `data:`, `*.supabase.co/.in`, `*.gstatic.com`, `*.googleusercontent.com`, the S3 bucket |
+| hardening present | `frame-ancestors 'none'`, `object-src 'none'`, `base-uri 'self'`, `upgrade-insecure-requests`, HSTS 2y preload includeSubDomains, `X-Frame-Options: DENY`, `Permissions-Policy` locking camera/mic/geolocation, `Referrer-Policy: strict-origin-when-cross-origin` |
+
+Reading it:
+
+- **`script-src` allows `'unsafe-inline'`.** Not a standalone finding - missing or
+  weak headers are in their exclusions - but it is a decisive **amplifier**: any
+  HTML injection you find is directly exploitable because CSP will not contain it.
+  Say so in the impact section of an XSS report; do not report it alone.
+- **`script-src` allows all of `https://*.lithicblue.com`.** Any subdomain that
+  can be made to serve attacker-controlled JavaScript becomes a script source for
+  the app. Relevant to `proxy.lithicblue.com` (16.5) and to any future subdomain.
+- **`form-action` permits SharePoint origins**, so credential-bearing forms may
+  target Microsoft hosts. Worth tracing the SharePoint connect flow for where a
+  form posts and whether any token rides along.
+- `frame-src` for Office/Google viewers means documents render in third-party
+  frames - check what is passed in those URLs (file tokens, signed URLs, tenant
+  identifiers) and whether such a URL works for a user outside the project.
+- `*.supabase.in` is allowed alongside `.co`. Confirm nothing resolves there that
+  shouldn't.
+
+## 16.4 DNS and mail
+
+| Record | Value | Note |
+|---|---|---|
+| NS | `henry/may.ns.cloudflare.com` | Cloudflare DNS |
+| apex A | `216.150.1.1` | |
+| `www` A | `104.21.64.14`, `172.67.174.25` | Cloudflare proxied |
+| `na` | CNAME `0ebb0d8269e3adc9.vercel-dns-016.com` | Vercel |
+| `eu` | CNAME `8acb8348f2f7f80d.vercel-dns-016.com` | Vercel, distinct deployment |
+| `au` | CNAME `bce2c694a6a3068c.vercel-dns-016.com` | Vercel, distinct deployment |
+| `trust` | CNAME `...cname.vantatrust.com` | **third-party host on their domain** |
+| `auth` | **no record at all** (SOA only) | has a certificate in CT logs but does not resolve |
+| MX | `lithicblue-com.mail.protection.outlook.com` | Microsoft 365 |
+| SPF | `v=spf1 include:spf.protection.outlook.com ~all` | |
+| DMARC | `p=quarantine`, reports to Cloudflare | |
+| TXT | `google-site-verification`, `linkedin-site-verification`, `MS=ms30419786` | Google Workspace + Microsoft verification |
+| CAA | letsencrypt, pki.goog, comodoca, ssl.com, digicert (issue + issuewild) | permissive but not a finding |
+
+- **`auth.lithicblue.com` has no DNS record**, yet a certificate exists for it in
+  CT logs and the bundles reference `NEXT_PUBLIC_AUTH_URL` /
+  `NEXT_PUBLIC_BETTER_AUTH_URL`. No record means **nothing to take over** - there
+  is no dangling CNAME. Keep watching it: if it later points at an unclaimed
+  provider, it becomes a takeover candidate, and because `script-src` trusts
+  `*.lithicblue.com`, control of it would be serious. Re-check periodically.
+- Interesting detail: `www.lithicblue.com/landing` serves a CSP naming the **AU**
+  bucket while `na.lithicblue.com` names the NA bucket, which suggests the
+  www/apex host is served by the AU deployment. If so, `www` and `au` may share
+  state, which is useful context for the cross-region work.
+
+## 16.5 Correction and non-findings
+
+- **Correction.** I earlier described `proxy.lithicblue.com` as resolving to a
+  private or internal IP. It does not: it resolves to **Cloudflare's own anycast
+  addresses** (`104.21.64.14`, `172.67.174.25`), the same as `www`, which creates
+  a proxy loop - hence Cloudflare's "DNS points to prohibited IP" page. It is a
+  broken record, not an internal-IP leak. Still an excluded operational issue, and
+  still worth a one-line mention in any report that already covers `*.lithicblue.com`
+  being a trusted script source.
+- **S3 buckets are locked down.** `lith-s3-bucket-na` and `lith-s3-bucket-au`
+  return `403 AccessDenied` on a root listing; `lith-s3-bucket-eu` exists (a 301
+  region redirect) and is likewise not listable. Checked with status codes only, no
+  contents retrieved. **Do not report these.**
+- Supabase anon key in the bundle: publishable by design, not a finding.
+- CAA permissiveness, DMARC at `quarantine` rather than `reject`, and the
+  `'unsafe-inline'` CSP: all excluded or non-qualifying on their own.
+
+## 16.6 Priority order, revised again
+
+1. **SB1-SB3** Supabase RLS on reads, writes and Realtime (16.1) - tied for top,
+   and settle the scope question by email first
+2. **E1** self-assign `role` -> Better Auth admin plugin -> impersonation (15.6)
+3. **RC1** `lb_region` cookie tampering for cross-region data access (16.2)
+4. **RC2** session cookie `Domain` scope, including transmission to Vanta (16.2)
+5. **R5** research-controls personal/organisation merge bypass (15.2)
+6. **P2** project add-member with a cross-organisation user ID (15.1)
+7. **O4** cross-region OAuth token and client acceptance (section 14)
+8. **W1** invite above your own role level (section 7)
+9. **M1** MCP tool object authorization with foreign IDs (section 8)
+10. **L1** legacy `engagementId` parameter alias (15.5)
+11. **S1** Drive/SharePoint ACL propagation into the knowledge base (15.3)
