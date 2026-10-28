@@ -838,6 +838,10 @@ www  dpl_48D46hhDDpodFKXXRss3sKCLoQ7U    <- identical to eu
 All three serve 23 chunks on the login page, but **10 chunk names differ between
 every pair**. Three separate Vercel deployments carrying different code.
 
+> **SUPERSEDED - see 18.1.** The chunk-name divergence below turned out to be
+> build metadata, not different code. The claim that the regions run different
+> logic was wrong. Read 18.1 before acting on BD1/BD2.
+
 **BD1 - Deployment drift.** The regions are not in lockstep, so:
 - When you find and report a bug, **check the other two regions** before you
   write it up. "Present on `na` and `au`, fixed on `eu`" is useful intelligence
@@ -1032,3 +1036,109 @@ Confidentiality, highest reward first:
 
 And on every confirmed finding: **re-test the other two regions** (BD1). The
 builds differ, so scope is per-region until proven otherwise.
+
+---
+
+# 18. Corrections and verification pass
+
+Claims from earlier sections, re-tested. Two needed correcting.
+
+## 18.1 CORRECTION: the regions do **not** run different code
+
+Section 17.2 claimed the three regions run different builds, inferring it from 10
+differing chunk names per pair, and advised that a fix in one region might not be
+in another. **That inference was wrong.** I verified it properly:
+
+Downloaded all 23 login-page chunks from each region (1.4 MB per region) and
+compared their string tables:
+
+| Comparison | Differing strings | Out of |
+|---|---|---|
+| `na` only, vs `eu`+`au` | **1** | 2693 unique strings |
+| `eu` only, vs `na`+`au` | **1** | 2693 |
+| `au` only, vs `na`+`eu` | **7** | 2700 |
+
+And every differing string is build metadata, not logic:
+
+- The single `na`-only and `eu`-only strings are **Sentry debug IDs** -
+  `(e._debugIds||(e._debugIds={}))[n]="b0d3256a-…"`. Sentry injects one UUID per
+  built bundle; all three regions carry 46 such references.
+- The 7 `au`-only strings are **per-deployment Vercel analytics proxy paths**
+  (`fc5fd5697597ae79/script.js|event|session|view`, `ce69be3b314c8aa6/script.js|vitals`)
+  plus two more debug-ID UUIDs. These are the same mechanism as
+  `9bb3665e28f2b230/script.js` on `www` (17.7) - each deployment gets its own
+  hashed first-party path proxying Vercel Speed Insights and Web Analytics.
+
+Chunk **names** diverge because the content hash incorporates the injected debug
+ID, which then cascades into every cross-reference between chunks. So three
+separate builds of what is, on this evidence, **the same source**.
+
+**Corrected guidance.** There is no evidence of logic drift between regions, and
+"fixed in one region, live in another" is not a finding to go looking for.
+
+What survives, weaker and for different reasons:
+- These are still **three independent deployments**, so they *can* drift later.
+  Re-testing a confirmed finding against the other two regions costs one request
+  and occasionally pays - do it as cheap diligence, not as a theory.
+- This comparison covers only the **public login-page bundles**. The authenticated
+  application chunks were not compared, and cannot be without an account. Treat
+  authenticated-side parity as unverified.
+- The cross-region authorization tests (O4, RC1, C5, M6) are **unaffected** by
+  this correction. They test whether one region's issuer, token or routing cookie
+  is honoured by another - that is server-side behaviour, independent of whether
+  the client bundles match.
+
+## 18.2 CONFIRMED: the Supabase project is genuinely theirs
+
+Section 16.1 reported project ref `pcsyssamsygzgixvvxxc` from an anon JWT. I
+checked whether that was real configuration or just vendored library/test data,
+since embedded example keys are common. It is real:
+
+```js
+createBrowserClient(
+  "https://pcsyssamsygzgixvvxxc.supabase.co",
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBjc3lzc2Ftc3lnemdpeHZ2eHhjIiwicm9sZSI6ImFub24i..."
+)
+```
+
+with `X-Client-Info: supabase-ssr/0.9.0 createBrowserClient`, `flowType: "pkce"`,
+`detectSessionInUrl`, `persistSession: true`. A genuine browser-side client
+pointed at their project. Section 16.1 stands.
+
+Two refinements:
+
+- **The archived build used Supabase *Auth*** (`flowType: "pkce"`,
+  `detectSessionInUrl`), whereas the current build uses **Better Auth**. They
+  migrated auth providers, which fits the `auth.lithicblue.com` decommissioning in
+  June 2026 (17.1). Supabase appears to have been demoted from identity provider
+  to data layer - and a migration between auth systems is exactly the kind of
+  change that leaves orphaned rows, stale policies and dual-path authorization.
+  Worth probing: do any Supabase RLS policies still key off a
+  `auth.uid()` / Supabase-session identity that Better Auth no longer populates?
+  A policy whose subject is always NULL can fail open.
+- **The anon key is from an ~April 2025 build and may have been rotated.** The
+  project ref is almost certainly still current, but extract the live key from the
+  authenticated bundle rather than relying on the archived one.
+- **No table names were recoverable.** Only the vendored supabase-js library is in
+  the public/archived bundles - no `.from("table")` call sites. `postgres_changes`,
+  `broadcast` and `presence` appear, but those are library-internal Realtime
+  strings, not evidence of specific subscriptions. Table names will come from the
+  authenticated bundle or from the PostgREST schema endpoint (SB5).
+
+## 18.3 Standing corrections list
+
+For the record, everything I have had to revise during this engagement:
+
+1. **`proxy.lithicblue.com`** - I first said it resolved to a private/internal IP.
+   It resolves to Cloudflare's own anycast addresses, causing a proxy loop.
+   Corrected in 16.5.
+2. **Regional build drift** - claimed as different code in 17.2; it is build
+   metadata only. Corrected in 18.1.
+3. **`www` and the AU bucket** - 17.2 noted `www`'s `/landing` CSP naming the AU
+   S3 bucket while `/login` reports the EU deployment ID. Given 18.1, the likely
+   explanation is simply a stale prerendered page cached across deployments, not
+   a cross-region oddity. Still worth confirming whether cached pages can serve
+   stale configuration, but it is not evidence of regional divergence.
+4. **Better Auth admin POST routes** - a GET returning an empty-body 404 is a
+   method mismatch, not proof the route is absent. Stated in 15.6; repeated here
+   because it is easy to misread as "those endpoints don't exist".
