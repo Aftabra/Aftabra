@@ -1429,3 +1429,146 @@ With no RLS backstop, application-layer authorization is everything:
 11. **ING1/ING3** HTML source rendering -> stored XSS; remote content in email/HTML ingestion -> SSRF (17.4)
 12. **SB7** whether the decommissioned Supabase project is still live (20.1)
 13. **SSO gating** whether hidden Google/Microsoft sign-in endpoints are reachable (20.5)
+
+---
+
+# 21. Server Action inventory - 24 named RPC endpoints
+
+Recovered without an account. `createServerReference` carries the action's
+**source function name** as its final argument:
+
+```js
+createServerReference("7f592e46704fbc2820d016a3c50430016d10056e07",
+                      callServer, void 0, findSourceMapURL, "getUserProfile")
+```
+
+So the public bundles give up the complete named server-side RPC surface. 98 IDs
+resolve to **24 distinct actions** - roughly four IDs each, one per deployment
+(`na`/`eu`/`au`/`www`), confirming SA5: IDs are per-build and rotate on redeploy.
+Full ID map in **`lithicblue/server-actions.txt`**.
+
+Invocation shape:
+
+```
+POST https://na.lithicblue.com/<any-route>
+Next-Action: <action-id>
+Content-Type: text/plain;charset=UTF-8
+
+[<arg1>, <arg2>, ...]
+```
+
+## 21.1 The inventory
+
+| Action | Category | What to test |
+|---|---|---|
+| `getCurrentUser` | identity | baseline; compare to `/api/auth/get-session` |
+| `getUserProfile` *(legacy)* | identity | archived build - try the old ID (L1) |
+| `getProjectsForUser` | read | whose projects? pass another user/org id |
+| `getEngagementsForUser` *(legacy)* | read | **legacy naming** - old ID still live? (L1) |
+| `getUserEngagement` *(legacy)* | read | as above |
+| `getProjectFileCapacity` | read | takes a project id -> cross-org read |
+| `getProjectProcessingStatus` | read | takes a project id -> cross-org read |
+| **`getPresignedUploadUrls`** | **S3 write** | see 21.2 |
+| **`getPresignedUpdateUrl`** | **S3 write** | see 21.2 - *update*, not upload |
+| **`getBackendFileUploadUrl`** | **S3 write** | see 21.2 |
+| **`getDeliverableUploadUrl`** | **S3 write** | see 21.2 |
+| `confirmSourceFileUpload` | upload state | confirm an upload into someone else's project |
+| `discardDeliverableUpload` | upload state | discard another project's pending upload |
+| `createDeliverableFromUpload` | mutation | create a deliverable in a foreign project |
+| **`ensureFolderPaths`** | **path handling** | see 21.3 |
+| `createSharedProject` | mutation | a "shared project" concept absent from the docs - investigate what sharing means here |
+| `updateProjectSettings` | mutation | settings write as a project Member; cross-org |
+| `updateProjectContext` | mutation | as above |
+| `saveProjectScope` | mutation | as above |
+| `deleteDeliverable` | **destructive** | deleting another org's deliverable = integrity. Test read-only first; confirm authz before any destructive call, and only ever on your own objects |
+| `extractProjectDetailsFromUploadedFile` | parsing | the second ingestion pipeline (ING5) |
+| `requestScopeQuestionsGeneration` | AI job | triggers generation - cost and authz |
+| `retryFailedKAGProcessing` | AI job | re-run the knowledge pipeline on a project id |
+| `dismissFailedKAGProcessing` | AI job | dismiss another project's failure state |
+| **`clearUserTierCookie`** | **entitlement** | see 21.4 |
+| `submitFeedback` | input | stored-XSS sink candidate |
+| `submitOfferRequest` | input | ditto; also check for unauthenticated reachability |
+
+Notably **absent**: no organisation, member or invitation actions. That supports
+the earlier inference (RUNBOOK 1.6) that org and member management lives in tRPC,
+not Server Actions. Capture those from the UI.
+
+## 21.2 Presigned URL generation - the strongest lead in this inventory
+
+Four separate actions mint S3 URLs: `getPresignedUploadUrls`,
+`getPresignedUpdateUrl`, `getBackendFileUploadUrl`, `getDeliverableUploadUrl`. The
+buckets are `lith-s3-bucket-{na,eu,au}` (16.1), and anonymous listing is correctly
+denied - so presigned URLs are the *intended* access path.
+
+**PS1 - Client-supplied object key.** If any of these accepts a key, path or file
+id from the caller and signs it without validating that it belongs to a project
+you are a member of, you obtain a signed URL for an arbitrary object. Test with an
+object identifier from Org B. A signed **GET** is cross-organisation document
+disclosure; a signed **PUT** is worse.
+**PS2 - `getPresignedUpdateUrl` specifically.** "Update" implies a signed write
+over an **existing** object. If the target is caller-controlled, that is arbitrary
+overwrite of another organisation's source documents or deliverables - direct
+integrity compromise of client advisory material. This is the single highest-impact
+item in the inventory.
+**PS3 - Scope of the signature.** Inspect the returned URL: is it scoped to one
+key, or does it carry a prefix or wildcard? Does it permit `PUT` when only `GET`
+was needed? What expiry? Signed URLs with broad prefixes are a common mistake.
+**PS4 - Confirm-step trust.** `confirmSourceFileUpload` presumably records that an
+upload completed. If it trusts caller-supplied metadata (key, size, type, project
+id), you may be able to register a file into a project you do not belong to, or
+mislabel what was uploaded.
+**PS5 - Bucket crossing.** Each region has its own bucket. Can a presigned URL
+request made at `na` be made to sign an object in `lith-s3-bucket-eu`? That is the
+cross-region test with teeth.
+
+Keep every test to objects **you** created. A signed URL to someone else's file is
+exactly the "come across user data" case - stop and report.
+
+## 21.3 `ensureFolderPaths` - path construction from caller input
+
+The name says it builds folder paths. Folder structures are mirrored from
+Drive/SharePoint (ING6), so path strings flow from names you control.
+
+- Traversal sequences (`../`, encoded variants, absolute paths, UNC, null bytes)
+  in folder names, aiming at writing outside the intended project prefix.
+- Does it create paths in a project id you pass? If the project id is unvalidated,
+  this writes structure into another organisation's project.
+- Interaction with 21.2: a traversal here plus a presigned URL there is a chain -
+  control the prefix, then sign a write to it.
+
+## 21.4 `clearUserTierCookie` - entitlement held in a cookie
+
+This action's existence proves there is a **user tier cookie**, and "tier" means
+plan level. Recall `/docs/mcp`: the MCP connector "requires a paid-tier
+entitlement" (I7/M3).
+
+- **TC1 - Is the tier cookie trusted?** Find it (alongside `lb_region`), read its
+  format, and try forging a higher tier. If any gate reads the cookie rather than
+  re-checking the subscription server-side, that is paid-feature access without
+  payment, and plausibly MCP connector access.
+- **TC2 - Signed or not?** If it is a bare value or unsigned JSON, that is the bug.
+  If it is signed, check the algorithm and whether `alg: none` or a weak key is
+  accepted.
+- **TC3 - Scope.** `lb_region` is `Domain=.lithicblue.com` (16.2). If the tier
+  cookie is domain-wide too, it also travels to the Vanta-hosted `trust` subdomain.
+- **TC4 - Where it is enforced.** The reliable finding is a *server-side* gate
+  reading it. A merely cosmetic UI gate is weaker; pair it with an action call that
+  should be paid-only to show real impact.
+
+Frame impact as circumvention of a permission control (their threat model) plus
+revenue loss - not merely a cosmetic unlock.
+
+## 21.5 How to work this inventory
+
+1. Extract the **current** action IDs yourself once signed in - the authenticated
+   bundles will hold more actions than these 24, and IDs rotate per deployment.
+   Re-run the same `createServerReference` regex against the authenticated chunks.
+2. For each action, establish the argument shape by triggering it from the UI once
+   and capturing the request.
+3. Then replay with (a) no session, (b) an Org A **Member** session, (c) an **Org
+   B** session, substituting Org A identifiers.
+4. Prefer read-only actions first to map authorization cheaply; only use mutating
+   actions against objects you own, and never the destructive ones against
+   anything that is not yours.
+5. Try each action's ID while POSTing to an unauthenticated route such as
+   `/login` (SA4) - action IDs are generally not bound to the route that uses them.
