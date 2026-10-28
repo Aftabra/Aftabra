@@ -593,6 +593,11 @@ copy, transfer, disclose, or otherwise retain this information."
 
 ## 16.1 Supabase is in the data path - likely the single biggest surface
 
+> **LARGELY SUPERSEDED - see 20.1.** The trust centre's complete sub-processor
+> list names PlanetScale for database hosting and does **not** include Supabase.
+> Supabase appears to have been removed from the current stack; the CSP entries
+> are stale. Read 20.1 before spending time on SB1-SB6.
+
 The app's CSP on every page includes:
 
 ```
@@ -1229,3 +1234,198 @@ The two things to do before testing, both one email to security@lithicblue.com:
    the highest-severity findings most likely live.
 2. Ask whether they want an identifying header on research traffic, and confirm
    manual testing with two self-provisioned organisations is acceptable.
+
+---
+
+# 20. Fifth pass - headless rendering: sub-processors, Server Actions, stack correction
+
+The trust centre and the auth pages are client-rendered, so static fetches had
+returned shells. Rendering them in headless Chromium (a normal page visit, no
+payloads) closed the last collection gap and opened a surface I had missed.
+
+## 20.1 CORRECTION: the database is PlanetScale, not Supabase
+
+The trust centre publishes the **complete sub-processor list - 15 entries** - and
+**Supabase is not among them**:
+
+| Sub-processor | Role |
+|---|---|
+| **Amazon Web Services** | Cloud provider |
+| **PlanetScale** | **Database hosting** |
+| **Temporal Technologies Inc.** | Workflow management |
+| **Fly.io** | Compute / hosting services |
+| **Vercel** | Hosting |
+| **Claude** | **LLM services** |
+| **Tavily** | **"LLM-friendly web search results for our agents"** |
+| **Google Workspace** | Identity provider, IDAM |
+| **Stripe** | Finance and payments |
+| **PostHog** | Anonymised telemetry |
+| **Sentry** | Monitoring |
+| **Aikido** | **Vulnerability scanning** |
+| **GitHub** | Version control |
+| **Vanta** | Compliance monitoring |
+| **Instatus** | Status page |
+
+Section 16.1 made Supabase RLS the top priority. That was based on the CSP
+allowing `*.supabase.co` plus `wss://`, and on a `createBrowserClient` call found
+in an **archived** bundle. Both facts were real, but the conclusion was not:
+
+- The Supabase client appears **only in the archived build**, never in a current
+  bundle.
+- That archived build used **Supabase Auth**; the current one uses Better Auth.
+- The sub-processor list names **PlanetScale** for database hosting.
+
+So they migrated off Supabase, and the `*.supabase.co` CSP entries are **stale
+leftovers**. SB1-SB6 are largely moot. Two things survive:
+
+- **SB7 - is the old project still alive?** Project `pcsyssamsygzgixvvxxc` and its
+  anon key are published in a bundle the Internet Archive still serves. If that
+  project still exists and still holds customer data from the pre-migration era,
+  a decommissioned-but-live datastore with a published key is a genuine
+  confidentiality finding. Worth one careful check - and the same discipline
+  applies: stop at the first sign of real data, retain nothing.
+- **The stale CSP entries** are not a finding on their own (excluded as a header
+  issue), but they are worth a sentence in any report as evidence of incomplete
+  migration cleanup.
+
+**The more important consequence: PlanetScale is MySQL/Vitess, which has no
+row-level security.** There is no database-level backstop. Every cross-organisation
+check lives in **application code** - the tRPC procedures and Server Actions. A
+missing check is therefore a direct cross-org read with nothing behind it to fail
+safe. That makes the application-layer authorization tests (C1, C2, P2, M1, W1)
+the *primary* path, not a secondary one. Promote them.
+
+## 20.2 NEW SURFACE: Next.js Server Actions
+
+Rendering `/login` and `/signup` shows the client issuing:
+
+```
+POST https://na.lithicblue.com/login      <- not a REST endpoint; a Server Action
+POST https://na.lithicblue.com/signup
+GET  https://na.lithicblue.com/api/auth/get-session
+GET  https://na.lithicblue.com/login?_rsc=7h4hBxM0R4J5OFVf
+```
+
+Authentication is implemented as **Next.js Server Actions**, POSTed to the page's
+own route, not as direct Better Auth REST calls. This also explains the
+`createServerReference("7f592e46704fbc2820d016a3c504300…")` found earlier in an
+archived bundle - that is a Server Action ID.
+
+Why this matters: a Server Action is an **RPC endpoint reachable by anyone who
+knows its ID**. It is invoked by POSTing to any route with a `Next-Action: <id>`
+header and the arguments as the body. Consequences to test:
+
+- **SA1 - Direct invocation.** Extract action IDs from the bundles (they appear as
+  `createServerReference("<40-hex>")`) and invoke them directly, skipping the UI
+  entirely. Every client-side validation is bypassed by construction; the only
+  thing left is whatever the action itself checks.
+- **SA2 - Authorization inside each action.** Server Actions are a common place
+  for missing authorization, because they look like local function calls in the
+  source. Enumerate every action and test each as an unauthenticated caller, as a
+  Member, and as an Org B user.
+- **SA3 - Argument tampering.** Actions receive structured arguments. This is
+  where to retry the E1 mass-assignment idea: if an action updates a user or
+  member record, add `role` to its argument payload.
+- **SA4 - Cross-route invocation.** Action IDs are generally not bound to the
+  route that uses them. Try invoking a privileged action's ID while POSTing to an
+  unauthenticated page such as `/login` or `/landing`.
+- **SA5 - ID stability.** Action IDs are derived at build time, so they are stable
+  for a deployment and change when it redeploys. Capture them per region.
+- **SA6 - RSC payloads.** The `?_rsc=<token>` requests return React Server
+  Component payloads. On a protected route, an RSC payload sometimes contains
+  server-rendered data the UI would not display. Request `?_rsc=` variants of
+  authenticated routes and read the raw payload rather than the DOM.
+
+Combined with 20.1 - no RLS, all authorization in application code - Server
+Actions become the most likely home for a cross-organisation bug in this product.
+
+## 20.3 Tavily changes the research-agent analysis
+
+`Tavily - "Provides LLM-friendly web search results for our agents"`.
+
+The research agent searches via **Tavily's API**, which means **Tavily's
+infrastructure performs the fetching**, not LithicBlue's. This refines section
+17.5 and downgrades part of R1:
+
+- **Classic SSRF through the research agent is unlikely.** Pointing it at
+  `169.254.169.254` or RFC1918 would reach *Tavily's* network, not LithicBlue's -
+  and attacking Tavily is attacking a third party, which is out of scope. Do not
+  pursue that.
+- **The permission-control bypass is still entirely valid, and is the real
+  finding.** Tavily's API takes `include_domains` / `exclude_domains` parameters,
+  which almost certainly implement Research Controls' "Restrict to domains" and
+  "Exclude domains" modes directly. So R5 becomes: **what exactly gets passed to
+  Tavily, and who can influence it?** If the personal/organisation merge (15.2) is
+  computed client-side or forwarded unsanitised, a Member controls the
+  organisation's research filter. Out-of-band confirmation still works - a
+  callback to a domain you control proves the filter was widened.
+- **SSRF should be hunted in ingestion instead** (ING3): remote content referenced
+  by an uploaded email or HTML document, fetched by LithicBlue's own parser, is a
+  much more plausible SSRF path than the search agent.
+
+## 20.4 Temporal: authorization at submission versus at execution
+
+`Temporal Technologies Inc. - Workflow management`. Document processing, claim
+verification and research runs are long-lived workflows, which is exactly the
+shape Temporal exists for.
+
+- **TW1 - Revocation during a workflow.** A workflow authorized at submission
+  carries its context forward. Start a long job (upload a large source set, or
+  Run Research), then **remove yourself from the project or organisation** while
+  it is in flight. Does it still complete? Does its output still land where you
+  can read it? Does the result email still arrive? This is the concrete version of
+  W7 and a clean finding if authorization is only checked at submission.
+- **TW2 - Workflow identifiers.** If a workflow or job ID is exposed to the client
+  for status polling, test whether another user's ID can be polled, cancelled or
+  signalled.
+- **TW3 - Result delivery.** Results are emailed with a link (INT5). Check whether
+  completion notifications respect current membership rather than membership at
+  submission time.
+
+## 20.5 Signup shape, and other details from rendering
+
+- **`/signup` fields:** `email`, `password` (placeholder "min. 12 characters"),
+  `confirmPassword`. **No name and no organisation field** - so organisation
+  creation happens after first sign-in, consistent with the first-run flow in
+  17.6a. A 12-character minimum is a sensible policy; password-policy suggestions
+  are excluded from rewards anyway.
+- **`/login` fields:** `email`, `password`. Links to `/forgot-password`, `/signup`.
+  Note the rendered login page shows **no Google or Microsoft SSO button** on
+  `na`, despite the docs describing Google/Microsoft SSO and Drive settings being
+  "only available to Google-identity users". Worth checking whether SSO is
+  flag-gated per organisation, and whether the SSO sign-in endpoints are reachable
+  directly even where the button is hidden (a UI-only gate is the classic case).
+- **Console error:** `na.lithicblue.com/landing?_rsc=…` redirects to
+  `www.lithicblue.com/landing` and is then blocked by CORS. A cross-host redirect
+  of an RSC fetch - a bug, but a functional one with no security impact. Not a
+  finding.
+- **PostHog host is `eu-assets.i.posthog.com` even on the NA deployment.** Minor,
+  and telemetry is described as anonymised. Not a finding, but note it if you ever
+  argue about regional data flow.
+- **Aikido provides "vulnerability scanning services".** They run automated
+  scanning already. Combined with their exclusion of automated findings, this is
+  confirmation that scanner-grade output is worthless here. Logic bugs only.
+- **Compliance is achieved, not pending.** The trust centre offers a SOC 2 Type 2
+  report and an ISO 27001 certificate dated Jul-2026, while `/docs/security` still
+  says they are "actively pursuing" both. Stale documentation, not a vulnerability.
+- **Declared data categories** include customer PII, employee PII, **credit card
+  information** and **personal health information**. Useful for impact framing: a
+  confidentiality breach here is not merely commercial.
+
+## 20.6 Priority order, final
+
+With no RLS backstop, application-layer authorization is everything:
+
+1. **SA1-SA4** Server Action direct invocation and authorization (20.2) - new, and the most likely home for a cross-org bug
+2. **E1 / SA3** `role` mass assignment, now also via Server Action arguments (15.6, 20.2)
+3. **DWD1/DWD2** Drive domain-wide-delegation impersonation and connection binding (17.3)
+4. **C1/C2/P2** object-ID authorization across organisations, including the `projectId`/`fileId` pair and project add-member (6, 15.1)
+5. **RC1/RC2** `lb_region` tampering; session cookie domain scope incl. Vanta (16.2)
+6. **R5 + 20.3** research-controls merge bypass, confirmed out of band
+7. **TW1** revocation during an in-flight Temporal workflow (20.4)
+8. **M1/M3** MCP tool object authorization and paid-tier entitlement (8)
+9. **O4** cross-region OAuth token/client acceptance (14)
+10. **INT1-INT3** verdict tampering, contradiction override, CSV formula injection (17.6)
+11. **ING1/ING3** HTML source rendering -> stored XSS; remote content in email/HTML ingestion -> SSRF (17.4)
+12. **SB7** whether the decommissioned Supabase project is still live (20.1)
+13. **SSO gating** whether hidden Google/Microsoft sign-in endpoints are reachable (20.5)
