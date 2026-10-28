@@ -165,7 +165,9 @@ Status key: ` ` untested · `~` in progress · `P` pass (no issue) · `F` findin
 [ ] 27.5b     Value positions - error-based and boolean only, no time-based
 [ ] 27.5c     Numeric positions (limit, offset, numeric ids)
 [ ] 27.5d     LIKE wildcard widening a scoped search -> cross-org read
-[ ] SQLI-ORM1 ORM operator objects in place of scalars   <- most likely on this stack
+[ ] TRPC1     Sweep every procedure unauth w/ legitimate Origin - look for non-NOT_FOUND/UNAUTHORIZED
+[ ] 28.3a     Use {} to dump each endpoint's input schema
+[ ] SQLI-ORM1 ORM operator objects in place of scalars - against SERVER ACTIONS first (§28.3c)
 [ ] SQLI-ORM2 Type juggling in procedure inputs
 [ ] SQLI-ORM3 Extra keys passed through into queries/writes
 ```

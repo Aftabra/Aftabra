@@ -2625,3 +2625,160 @@ mass-assignment test in 22.2.
 Of everything in this section, **ORM operator injection is the item worth your
 time.** It fits this architecture, it needs no raw SQL anywhere, and it produces
 exactly the cross-organisation outcome their programme pays most for.
+
+---
+
+# 28. The data layer from outside: tRPC reachable, and the validation envelope
+
+## 28.1 tRPC mounts at `/api/trpc/[trpc]` behind an Origin check
+
+```
+GET /api/trpc/user.getCurrent                          -> 403, body "Forbidden" (9 bytes, text/plain)
+GET /api/trpc/user.getCurrent  Origin: https://na…     -> 404, tRPC JSON error
+GET /api/trpc/user.getCurrent  Origin: https://evil…   -> 403, "Forbidden"
+GET /api/trpc/user.getCurrent  Referer only            -> 403, "Forbidden"
+```
+
+The bare 403 is an **Origin check**, and it behaves correctly: a foreign origin is
+rejected, only the legitimate origin passes, and `Referer` alone is not accepted.
+That is CSRF protection working. **It is not a finding** - do not report it.
+
+What matters is the consequence: **sending the legitimate `Origin` header, exactly
+as a browser does, reaches the tRPC router unauthenticated.** So you can exercise
+every procedure's authorization without holding a session at all. That removes the
+"you need an account to see the API" blocker for the *authorization* question,
+though not for discovering names (28.2).
+
+Other behaviour observed:
+
+- `trpc-accept: application/jsonl` -> `"Streaming requests must be batched (you can
+  do a batch of 1)"`. Streaming is enabled; batching works (`?batch=1&input={…}`
+  returns a JSON array).
+- `x-trpc-source` is accepted and ignored.
+- POST with a `{"json":…}` body routes identically, so mutations are reachable the
+  same way.
+- `/api/trpc` with no procedure -> Next.js 404 page; `/api/trpc/` -> 308.
+
+## 28.2 The procedure-existence oracle - and why it did not pay off yet
+
+tRPC's error distinguishes a missing procedure from other failures:
+
+```json
+{"error":{"json":{"message":"No procedure found on path \"user.getCurrent\"",
+ "code":-32004,"data":{"code":"NOT_FOUND","httpStatus":404,"path":"user.getCurrent"}}}}
+```
+
+A procedure that **exists but requires authentication** returns `UNAUTHORIZED`
+instead. That differential is a precise oracle: for any candidate name, one
+unauthenticated request tells you whether it exists.
+
+I probed **60 curated candidates** drawn from the 24 recovered Server Action names
+and the documented domain nouns - `user.*`, `project.*`, `organization.*`,
+`member.*`, `file.*`, `deliverable.*`, `claim.*`, `scope.*`, `task.*`,
+`datagap.*`, `library.*`, `research.*`, `admin.*`, `billing.*`, plus flat
+unnamespaced forms. **Every one returned `NOT_FOUND`.**
+
+So their naming convention is not any of the obvious ones, and I stopped there:
+continuing to guess names is brute-forcing, which their programme excludes and
+which would be a poor use of their rate limits either way.
+
+**How to use this once you are signed in (TRPC1).** Extract the real procedure
+names from the authenticated bundle with the same approach that recovered the
+Server Actions - tRPC clients reference paths as strings. Then, for each name,
+send one request **unauthenticated with the legitimate `Origin`** and read the
+code:
+
+| Response | Meaning |
+|---|---|
+| `NOT_FOUND` | no such procedure |
+| `UNAUTHORIZED` | exists, auth required - correct |
+| `FORBIDDEN` | exists, authenticated check failed - correct |
+| **`200` / `BAD_REQUEST` / validation error** | **exists and does NOT require authentication** - a validation error means your input reached the procedure body, which means it ran |
+
+That last row is the finding to hunt. A `BAD_REQUEST` about input shape from an
+unauthenticated caller proves the procedure executed without a session. Sweeping
+every procedure this way is cheap, needs no account, and directly tests the one
+layer that holds this application's authorization (26.1).
+
+## 28.3 The validation envelope is Zod, and strict
+
+Probed with bodies that cannot succeed - non-objects, malformed JSON, wrong types -
+so nothing was created and no credential check ran:
+
+```
+"notanobject"   -> 400 {"message":"[body] Invalid input: expected object, received string","code":"VALIDATION_ERROR"}
+[1,2,3]         -> 400 {"message":"[body] Invalid input: expected object, received array",...}
+null            -> 400 {"message":"[body] Invalid input: expected object, received null",...}
+{broken         -> 400 {"message":"Invalid JSON in request body","code":"BAD_REQUEST"}
+{}              -> 400 {"message":"[body.email] Invalid input: expected string, received undefined; [body.password] …"}
+{"email":12345,"password":67890,"name":[]}
+                -> 400 {"message":"[body.name] … expected string, received array; [body.email] … expected string, received number; …"}
+{"email":"x@invalid","password":"short"}
+                -> 400 {"message":"Password must be at least 12 characters long."}
+Content-Type: text/plain
+                -> 415 {"message":"Content-Type \"text/plain\" is not allowed. Allowed types: application/x-www-form-urlencoded, application/json","code":"UNSUPPORTED_MEDIA_TYPE"}
+```
+
+That phrasing is **Zod** (v4's "Invalid input: expected X, received Y").
+
+Three consequences:
+
+**28.3a - A free schema-discovery technique.** Sending `{}` returns **every**
+missing field and its expected type in one response. For any endpoint, one request
+yields its full input schema. Use this on tRPC procedures and Server Actions too -
+it is faster and quieter than reading minified code.
+
+**28.3b - This substantially closes type juggling and operator injection *at this
+layer*.** My §27.6 framing needs tightening. `{"email":12345}` is rejected with
+"expected string, received number", so a Zod string schema will equally reject
+`{"projectId":{"not":""}}` as "expected string, received object". Where Zod
+validates, SQLI-ORM1 and SQLI-ORM2 die at the door.
+
+**28.3c - Which is exactly why Server Actions are the place to test it.** Ranked by
+how likely unvalidated input is:
+
+| Layer | Validation | Verdict |
+|---|---|---|
+| Better Auth routes | Zod, strict, **confirmed** | operator/type tests will be rejected |
+| tRPC procedures | Zod is the tRPC idiom (`.input(z.object(…))`) - likely but unconfirmed | probably rejected; verify per procedure |
+| **Server Actions** | **no framework-enforced validation at all** - a Server Action is a plain function and validating its arguments is entirely the developer's choice | **the realistic target** |
+
+So redirect §27.6: run SQLI-ORM1/2/3 against the **24 Server Actions** first, and
+only then against tRPC. An action that accepts `{"projectId":{"not":""}}` without
+complaint has no input schema, and on this architecture that is a
+cross-organisation read.
+
+## 28.4 Better Auth meta endpoints
+
+```
+GET /api/auth/ok              -> 200 {"ok":true}
+GET /api/auth/jwks            -> 200 full JWKS (single RS256 RSA public key)
+GET /api/auth/error           -> 302
+GET /api/auth/list-sessions   -> 401 {"message":"Unauthorized","code":"UNAUTHORIZED"}
+GET /api/auth/session         -> 404   (not a route in this version)
+GET /api/auth/oauth2/register -> 404   (POST-only; the DCR endpoint from §14)
+```
+
+All expected and correct. The password policy (12 characters) is **enforced
+server-side**, confirmed by the error above - so it is not merely a UI hint.
+
+Minor ordering detail: `{"email":"x@invalid","password":"short"}` returns the
+password-length error rather than an email error or a "user already exists", so the
+policy check precedes the account lookup. That makes signup a poor email-enumeration
+oracle when the password is short - but §22.6 still stands for a well-formed
+request, where `USER_ALREADY_EXISTS` does disclose registration.
+
+## 28.5 What is and is not a finding here
+
+**Not findings - do not report:**
+- The Origin check in front of tRPC. It is correct CSRF protection.
+- `NOT_FOUND` vs `UNAUTHORIZED` distinguishing procedure existence. API-surface
+  enumeration is "non-confidential information", which their exclusions cover.
+- `/api/auth/ok`, the JWKS endpoint, verbose Zod validation messages. Field names
+  and types are not confidential, and their exclusions bar disclosure of
+  non-confidential information.
+
+**The finding to look for**, using all of the above: any tRPC procedure or Server
+Action that executes for an unauthenticated caller, or for a caller in another
+organisation. The tooling for that is now established and needs no account to
+begin - only the real procedure names, which come from the authenticated bundle.
