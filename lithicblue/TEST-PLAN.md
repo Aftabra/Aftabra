@@ -2339,3 +2339,117 @@ reading anything into `x-middleware-subrequest`; on a patched build it is inert.
   not worth the risk.
 - No iteration over object ids. One foreign id proves the authorization bug.
 - Nothing against real customer organisations, at any volume.
+
+---
+
+# 26. Sixth pass - the authorization model is one layer thick
+
+## 26.1 Every page shell is public; all protection is in the data layer
+
+Requested the RSC payload of every protected route unauthenticated. All returned
+**200** with ~16-19 KB, and every one carries an identical component set:
+
+```
+AuthProvider  TRPCProvider  ToastProvider  ClientPageRoot
+OutletBoundary  MetadataBoundary  SpeedInsights  IconMark  Image
+```
+
+`/admin`'s payload contains the string **`"Loading admin panel..."`** and a
+spinner class. No user data, no server-rendered content, no route-level redirect -
+on `/admin`, `/account`, `/projects`, `/project/[id]`, `/settings/organization`,
+`/libraries`, `/files/[id]`, `/kag/[id]` or `/tasks/[id]`.
+
+That means:
+
+- **There is no server-side route gate.** Pages are public shells. Authentication
+  and authorization happen *after* hydration, when the client calls tRPC and
+  Server Actions.
+- **`TRPCProvider` is on every route**, confirming tRPC is the data layer.
+- **`/admin` is served to anyone**, and its protection is entirely whatever its
+  data calls enforce. Combined with 22.3 (the admin nav is gated on
+  `user?.role === "admin"` in the browser), the console's *visibility* is a client
+  decision and its *data* is the only real control.
+
+**Put this together with 20.1 and the result is the key structural fact about this
+target:**
+
+| Layer | Present? |
+|---|---|
+| Route-level server gate | **No** - shells are public (this section) |
+| Application-layer checks in tRPC / Server Actions | **Yes - the only control** |
+| Database row-level security | **No** - PlanetScale/MySQL has none (20.1) |
+
+**The authorization model is exactly one layer thick.** Every tRPC procedure and
+every Server Action is load-bearing, and a single missing check is a direct
+cross-organisation read or write with nothing behind it to fail safe. There is no
+defence in depth to catch a mistake.
+
+That is the argument for where to spend your time, and it is also a strong framing
+sentence for any report you file: the finding is not "a check was missed in one
+place", it is "the only check was missed".
+
+## 26.2 Negative result: no RSC data disclosure
+
+SA6 (20.2) proposed that `?_rsc=` payloads on protected routes might carry
+server-rendered data the UI withholds. Tested across nine routes with `?_rsc=1`
+and a captured token, with and without an `RSC: 1` header: **every payload is a
+shell.** No data leaks this way. Drop SA6 as written.
+
+What survives is narrower and still worth doing **once authenticated**: compare an
+authenticated RSC payload against what the UI renders, in case a server component
+fetches more than it displays.
+
+## 26.3 CORRECTION: no evidence an Office add-in ships
+
+Section 24.3 built a test plan around an Office add-in on the strength of the
+`/addin/auth/done` route existing and `frame-src` permitting
+`*.officeapps.live.com`. Examined the route directly: it returns the standard app
+shell (307 plus a 23 KB body) with **no Office.js reference, no
+`Office.context.ui`, no `messageParent`, no `displayDialogAsync`** and no inline
+token handling. Grepping all 185 collected bundles finds only framework-internal
+`addEventListener("message")` / `onmessage` usage - React, Next, PostHog and
+Sentry all use `postMessage` routinely.
+
+So **AD1-AD3 are speculative**, not grounded. The route may be vestigial, or an
+add-in may load its own bundle not referenced from the public app. Treat it as:
+
+- **AD0** - first establish whether an add-in exists at all. Look for a
+  `manifest.xml` on their domain, a Microsoft AppSource listing, or any reference
+  once you are authenticated. If none, drop the whole thread.
+
+Only if one exists do the original postMessage-origin and document-reach tests
+apply. `frame-src` permitting Office origins is also explained by the SharePoint
+integration and document viewers, which is the simpler reading.
+
+## 26.4 Minor observations
+
+- `"admissionLimits"` appears as a string in the `/admin` shell payload - an
+  unexplained config or feature key. Worth noting what it gates once you can see
+  the admin panel.
+- `/articles` resolves with an **empty** `x-matched-path`, unlike every other
+  route. Probably a rewrite or a route group rather than a normal page. Minor, but
+  if `/articles` is handled by a rewrite then its authorization may differ from
+  the rest of the app - relevant to RT1 (the article CMS).
+- `/addin/auth/done` returns **307** while serving a full body. A redirect with
+  content is odd; worth a glance at the `Location` once authenticated.
+
+## 26.5 Updated priority order
+
+Shaped by 26.1 - the one-layer model means data-layer authorization dominates:
+
+1. **22.2** `userTier: "paid"` then `role: "admin"` mass assignment - Better Auth, tRPC, **and** Server Actions
+2. **SA1/SA2** Server Action authorization sweep across the 24 known actions - now the primary surface (20.2, 21)
+3. **RT1** `/articles/edit/[id]` -> content injection on a first-party origin under `unsafe-inline` CSP (24.2)
+4. **PS2** `getPresignedUpdateUrl` with a foreign object key (21.2)
+5. **RT2** `/libraries/datagaps/[id]` - the only object route lacking a project segment (24.2)
+6. **`/admin` data calls** - the shell is public, so enumerate what it fetches and test each call as a Member (26.1)
+7. **LA1** MCP consent-screen `client_name` spoofing and escaping (23.1)
+8. **LA2** tool poisoning via source documents into the victim's assistant (23.2)
+9. **TC1** tier-cookie forgery (21.4)
+10. **DWD1/DWD2** Drive domain-wide-delegation impersonation (17.3)
+11. **C1/C2/P2** cross-organisation object ids, including the mismatched-pair case (6, 15.1)
+12. **CP1/CP2** `lb_region` cache-key and authenticated RSC caching (24.4)
+
+Dropped or downgraded: SA6 (no RSC disclosure), AD1-AD3 (no evidence of an
+add-in), SB1-SB6 (Supabase gone), BD1 (no regional code drift), `?dpl=` pinning,
+`/_next/image` arbitrary-host SSRF, MCP transport variants.
