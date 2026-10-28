@@ -1,0 +1,19 @@
+{
+  "_comment": [
+    "Copy to scope.json and fill in from the program's OWN scope page.",
+    "Only hosts matched by in_scope are ever contacted.",
+    "  'example.com'   = that exact host",
+    "  '*.example.com' = subdomains of example.com, NOT the apex",
+    "                    (add the apex separately if the program covers it)",
+    "out_of_scope always wins over in_scope."
+  ],
+  "in_scope": [
+    "example.com",
+    "*.example.com"
+  ],
+  "out_of_scope": [
+    "blog.example.com",
+    "status.example.com",
+    "*.partners.example.com"
+  ]
+}
