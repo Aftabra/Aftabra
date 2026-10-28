@@ -1972,3 +1972,176 @@ Worth stating plainly so the boundary is unambiguous:
 The reason to hold this line is practical, not moral. You have eight reports with
 this programme. An out-of-scope test is the fastest way to lose that standing, and
 with no safe-harbour clause in their terms the legal exposure is personal.
+
+---
+
+# 24. The `x-matched-path` oracle, and three more lateral surfaces
+
+## 24.1 Technique: free route enumeration with no account
+
+Vercel returns an `x-matched-path` response header naming the **internal Next.js
+route** that handled the request:
+
+```
+GET /project/abc      ->  x-matched-path: /project/[projectId]
+GET /admin            ->  x-matched-path: /admin
+GET /nonexistent-xyz  ->  x-matched-path: /_not-found
+```
+
+Anything resolving to `/_not-found` does not exist; anything else is a real route,
+and **dynamic segments come back with their parameter names**. That is a complete
+route-enumeration oracle, unauthenticated, one request per candidate. Derive
+candidates from the legacy manifest (22.4) and the documentation rather than
+brute-forcing a wordlist - targeted probing is research, a wordlist run is the
+automated scanning their programme excludes.
+
+## 24.2 The current route table
+
+Confirmed present on `na`:
+
+```
+/project                      /projects
+/project/[projectId]          /files/[projectId]
+/kag/[projectId]              /tasks/[projectId]
+/view/[projectId]/[fileId]
+/libraries                    /libraries/datagaps/[id]
+/settings/organization        /settings/googleDrive
+/settings/sharepoint          /account
+/upgrade                      /admin
+/invite/[token]               /share/[token]
+/articles/edit/[id]           /articles/preview/[id]
+/addin/auth/done
+/api/mcp/[transport]          /api/auth/[...all]
+/api/health
+```
+
+**Removed since the legacy build** (all `/_not-found` now): `/chat/:id`,
+`/engagement/:id`, `/exemplar/:id`, `/document_template/:id`,
+`/libraries/persona/:id`, `/methods/list|result|template`, `/documents/*`,
+`/admin/users`, `/admin/oauth/clients`, `/admin/custom-providers`,
+`/admin/generate_link`. **Do not spend time on those** - the features are gone.
+`/admin` itself survives as a single route, so the console is client-routed now.
+
+Three findings from this table:
+
+**RT1 - `/articles/edit/[id]` and `/articles/preview/[id]` are LIVE.** The
+in-application article CMS from 22.5 is not a legacy artifact - it is in the
+current build. That makes the chain real and current: if authorization there is
+weak, you inject content into the public marketing site, and because the CSP sets
+`script-src 'self' 'unsafe-inline' https://*.lithicblue.com`, injected script
+executes on a first-party origin against every visitor. Test who can reach it,
+whether preview renders unsanitised input, and whether article ids enumerate.
+**This is now a top-tier item.**
+
+**RT2 - `/libraries/datagaps/[id]` is the odd one out.** Every other object route
+carries `[projectId]` in the path - `/files/[projectId]`, `/kag/[projectId]`,
+`/view/[projectId]/[fileId]`. This one takes a **bare `[id]`** with no project in
+the path at all. If authorization elsewhere leans on the project segment, this
+route has to resolve ownership from the id alone, which is exactly where
+object-level checks get forgotten. Probe it with ids from your other
+organisation. `/libraries` also exists as an index - check what it lists.
+
+**RT3 - `/api/mcp/[transport]` is a dynamic segment.** I tested ten transport
+values (`mcp`, `sse`, `http`, `stream`, `streamable`, `ws`, `message`, `messages`,
+`rpc`, `v1`) and **all ten return 401 with a proper `WWW-Authenticate` challenge**,
+so the gate is uniform and there is no unauthenticated transport variant. Good
+hygiene; do not report it. Worth revisiting **with a token**, though: different
+transports can take different code paths, and an SSE or streaming handler that
+skips a check the main handler applies is a plausible gap.
+
+## 24.3 The Office add-in - genuinely untested ground
+
+`/addin/auth/done` is live, and `frame-src` permits `*.officeapps.live.com` and
+`*.sharepoint.com` (16.3). So there is a Word/PowerPoint add-in.
+
+Why this is worth real attention: an Office add-in runs inside the user's
+document, has access to **the client material they have open**, and almost no
+bounty hunter has ever looked at one.
+
+- **AD1 - The auth completion handoff.** Add-in OAuth typically opens a dialog and
+  returns the result to the parent via `Office.context.ui.messageParent()`. That
+  call takes a target-origin option; if it is omitted or wildcarded, any page that
+  can host the dialog reads the message. Load `/addin/auth/done` directly, read its
+  source, and check: does a token arrive in the query string or fragment? Is it
+  reflected into the DOM? Is `messageParent` origin-restricted? Is there a
+  `postMessage` listener without an origin check?
+- **AD2 - The manifest.** Add-in manifests declare `AppDomains` and the source
+  location. Find it (the Office store listing, or a `manifest.xml` on their
+  domain). An over-broad `AppDomains` entry widens what can be framed; the source
+  URL tells you which routes the add-in actually uses.
+- **AD3 - Document reach.** Establish what the add-in can read and write in the
+  open document, then ask whether any of it crosses a project or organisation
+  boundary.
+- Note their exclusions bar clickjacking, but a `postMessage` origin failure is
+  not clickjacking - it is a token-theft primitive. Frame it that way.
+
+## 24.4 Cache poisoning and deception on Vercel
+
+Caching is demonstrably active, and I already have evidence of a **stale cached
+page**: `www/landing` served a CSP naming the **AU** S3 bucket while its
+deployment id was **EU**'s (18.3). Headers in play: `x-vercel-cache: HIT|MISS`,
+`x-nextjs-prerender: 1`, `x-nextjs-stale-time: 300`.
+
+- **CP1 - Does the cache key include `lb_region`?** That cookie selects a region
+  (16.2) and is set on first contact. If a response varies by it while the cache
+  key ignores it, a page cached for one region is served to another - cross-region
+  content delivery, and a poisoning primitive if any cached page carries
+  configuration.
+- **CP2 - RSC payload caching.** `?_rsc=<token>` responses are separately
+  cacheable. An authenticated RSC payload that lands in a shared cache and is
+  served to another viewer would be serious. Check `x-vercel-cache` and
+  `cache-control` on authenticated `?_rsc=` requests specifically.
+- **CP3 - Cache deception.** Request an authenticated path shaped like a static
+  asset (appended `.css`, `.js`, `/x.css`, encoded separators) and see whether the
+  CDN caches a private response under a URL an attacker can then fetch.
+- **CP4 - Stale configuration.** The `/landing` observation suggests prerendered
+  pages can outlive a deployment. Check whether any cached page serves
+  configuration that has since rotated - keys, endpoints, CSP, action ids.
+
+## 24.5 Middleware and routing-header manipulation
+
+`x-matched-path` is an internal Vercel/Next routing header. Two tests follow:
+
+- **MW1 - Supply it as a request header.** Send `x-matched-path: /admin` (and
+  `/api/...` variants) on a request to `/login` and see whether routing changes.
+  On some Next deployments internal routing headers supplied by the client are
+  honoured. If it works, it is a routing bypass.
+- **MW2 - The middleware-bypass class.** Next.js had a middleware
+  authorization-bypass issue in 2025 in which a crafted internal subrequest header
+  (`x-middleware-subrequest`) caused middleware to be skipped entirely - a full
+  auth bypass wherever authentication is enforced in middleware. **Verify their
+  Next.js version before assuming anything**: they build with Turbopack, which
+  implies a recent release that is very likely patched. Determine the version from
+  the bundles or a Vercel build artifact, check it against the advisory, and only
+  then test. If their auth is enforced in middleware and the version is affected,
+  this is critical; if patched, drop it immediately.
+- Also test whether `x-middleware-rewrite`, `x-invoke-path` or `x-invoke-status`
+  style headers are honoured inbound.
+
+## 24.6 Negative results - do not spend time here
+
+Recorded so they are not re-tested:
+
+| Test | Result |
+|---|---|
+| `?dpl=<other deployment id>` on an asset | **Ignored.** A garbage `dpl_000…` returns 200 too. It is a cache-buster, not a deployment selector - no Vercel skew-protection pinning attack. No `__vdpl` cookie observed. |
+| `/_next/image?url=https://example.com/…` | **`400 INVALID_IMAGE_OPTIMIZE_REQUEST`.** Remote patterns are restrictively configured - no arbitrary-host SSRF via the image optimiser. *Narrower test remains:* try the hosts the CSP already trusts (`*.supabase.co`, `*.googleusercontent.com`, the S3 bucket) to see which are in `remotePatterns`, since an open redirect on an allowed host would reopen it. |
+| All ten `/api/mcp/<transport>` values | **401 with auth challenge, uniformly.** No unauthenticated transport. |
+| `/api/health` | **`204 No Content`**, empty body, no version disclosure. `access-control-allow-origin: *` on an empty response is harmless. Not a finding. |
+| Legacy feature routes (`/chat`, `/methods/*`, `/exemplar`, `/document_template`, `/libraries/persona`, `/documents/*`) | **All `/_not-found`.** Features removed. |
+| Legacy admin sub-routes (`/admin/users`, `/admin/oauth/clients`, `/admin/custom-providers`, `/admin/generate_link`) | **All `/_not-found`.** Only `/admin` survives. |
+
+## 24.7 Priorities after this pass
+
+1. **22.2** `userTier: "paid"` then `role: "admin"` mass assignment, via Better Auth, tRPC **and** Server Actions
+2. **RT1** `/articles/edit/[id]` authorization -> content injection on a first-party origin with `unsafe-inline` CSP
+3. **PS2** `getPresignedUpdateUrl` with a foreign object key (21.2)
+4. **RT2** `/libraries/datagaps/[id]` - the only object route without a project segment
+5. **LA1** MCP consent-screen client-name spoofing, plus escaping on that page (23.1)
+6. **LA2** tool poisoning via source documents into the victim's assistant (23.2)
+7. **TC1** forge the tier cookie (21.4)
+8. **DWD1/DWD2** Drive domain-wide-delegation impersonation (17.3)
+9. **CP1/CP2** `lb_region` cache-key and authenticated RSC payload caching (24.4)
+10. **AD1** Office add-in auth handoff and `postMessage` origin (24.3)
+11. **SA1-SA4** Server Action authorization sweep (20.2, 21)
+12. **MW1** inbound `x-matched-path` routing manipulation (24.5)
