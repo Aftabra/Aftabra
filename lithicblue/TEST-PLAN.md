@@ -1766,3 +1766,209 @@ into an email/password account.
 10. **C1/C2/P2** object-id authorization across organisations (6, 15.1)
 11. **TW1** revocation during an in-flight Temporal workflow (20.4)
 12. **R5** research-controls merge bypass, confirmed out of band (15.2, 20.3)
+
+---
+
+# 23. Lateral angles - the bug classes nobody tests on this target
+
+Everything above is conventional application security. This section is the
+unconventional surface, and on an AI-native product it is where the least-trodden
+ground is. All of it stays inside their stated scope: LithicBlue-owned services
+handling sensitive user data, tested from accounts you control.
+
+## 23.1 The consent screen names the client - can you name it "Claude"?
+
+From `/docs/mcp` and `/docs/integrations/claude`:
+
+> "LithicBlue shows an **Approve access** screen **naming the assistant, the host
+> it connects back to**, and what it will be able to do… **No OAuth client ID or
+> secret is needed; LithicBlue registers itself automatically.**"
+
+Put those two sentences together. The client is created by **open dynamic
+registration** (14, O1), and the consent screen **renders the client's name**. In
+dynamic client registration the `client_name` is supplied *by the registering
+client* - i.e. by whoever sends the registration request.
+
+**LA1 - Consent-screen spoofing.** Register a client with
+`client_name: "Claude"` (and a `client_uri` / logo pointing wherever you like),
+then send a victim the authorization URL. The approval screen - the single control
+protecting this flow - tells them they are approving Claude. The entire security
+model of that screen is the name it displays.
+
+Escalate the test:
+- Is `client_name` validated, length-capped, or deduplicated against known hosts?
+- Is it **HTML-escaped** on the consent page? An injection there is XSS on an
+  OAuth consent screen, which is about the worst place to have one.
+- Does the screen show the actual `redirect_uri` host, or only the display name?
+  If the name is attacker-chosen and the destination is hidden, the screen is
+  decorative.
+- Combine with `prompt=none` (O2): a trusted-looking name plus silent
+  authorisation removes the user from the loop twice over.
+
+This is high-impact, needs only accounts you own, and is a *design* question that
+no scanner will ever ask.
+
+## 23.2 Tool poisoning: pivot out of LithicBlue into the victim's assistant
+
+This is the most interesting attack this product makes possible, and it inverts
+the usual direction.
+
+The MCP connector lets a user's AI assistant read their projects. The assistant is
+Claude, ChatGPT or Copilot - and in those hosts it typically has **other
+connectors attached**: the user's email, calendar, code repositories, file stores.
+
+Now recall that **project sources are attacker-influenceable**. A source document
+is untrusted text that LithicBlue reads, structures and later returns through MCP
+tools as claims, excerpts and citations.
+
+**LA2 - Indirect prompt injection with cross-system reach.** Place instruction
+text in a source document. When the victim asks their assistant about the project,
+LithicBlue's MCP tools return that text as tool output. Tool output is frequently
+treated with more trust than user input. The injected instructions then execute in
+a session that holds the victim's *other* connectors.
+
+Impact is not confined to LithicBlue: it is lateral movement from a document into
+whatever else the victim's assistant can reach. Test whether:
+- claim text, excerpt text, file names, scope requirement text or task titles are
+  returned through MCP tools verbatim;
+- any sanitisation or delimiting is applied to document-derived content before it
+  becomes tool output;
+- the write tools (`write_claims`, `add_feedback_comment`, `request_feedback`) can
+  be driven by injected instructions - that is injection achieving **state change**
+  inside LithicBlue, not just text echo.
+
+How to get a document in front of a victim legitimately: a shared cloud-synced
+folder, a project you are both members of, an exemplar or template if those are
+shared across organisations (22.4), or anything the invitation flow lets you
+contribute to before full membership.
+
+Frame the report in their terms: the confidentiality and integrity of user data,
+compromised by content their own pipeline ingests. This class is barely tested
+anywhere, and on a product whose entire purpose is reading untrusted documents it
+is squarely in scope.
+
+## 23.3 Attack the verifier, not the data
+
+LithicBlue's core promise is that every claim in a deliverable is checked against
+sources and labelled verified, contradicted, citation-issue or unverified. Their
+criteria pay for compromising the **integrity** of user data. So:
+
+**LA3 - Induce a false "verified".** Craft a source document that causes the
+verifier to mark a factually unsupported claim as verified. A consulting
+deliverable asserting a false figure with a green "verified, traced to source"
+badge is precisely the harm this product exists to prevent, and the client acts on
+it.
+
+**LA4 - Induce a false "contradicted".** The inverse: make a correct claim read as
+contradicted, so a true finding is removed from a client report.
+
+**LA5 - Win conflict resolution deliberately.** The ontological map "resolves the
+conflict before the information is ever used" and explains which source it trusts
+(the documented example reasons from recency and sign-off status). Craft a
+document that reliably wins - forged dates, apparent authority markers,
+sign-off-looking metadata - so your version becomes the resolved truth every later
+answer draws on.
+
+For impact, the crafted document must come from somewhere the victim does not
+control: a synced folder, a shared library, a co-member. Within your own project
+it is a curiosity; crossing a trust boundary makes it a finding.
+
+## 23.4 Economic and quota logic
+
+Not DoS - DoS is excluded. These are *correctness* bugs about money and limits.
+
+- **LA6 - Tier transitions.** Stripe handles payments and `userTier` gates
+  features (22.1). Test the edges: cancel a subscription and check whether
+  entitlement actually drops; downgrade while a paid workflow is mid-flight
+  (Temporal, 20.4); let a trial lapse and see whether `clearUserTierCookie` is the
+  *only* thing standing between you and the feature.
+- **LA7 - Capacity accounting.** `getProjectFileCapacity` implies a quota. Test
+  whether deleting and re-adding, uploading via different actions, or cloud sync
+  bypasses the count - and whether capacity is enforced per project while billing
+  is per organisation.
+- **LA8 - Entitlement at job start versus job run.** A paid-only AI job queued
+  while paid, executed after downgrade. Same shape as TW1.
+
+Keep volume minimal. One request proves a logic flaw; a hundred looks like the
+DoS testing they exclude.
+
+## 23.5 Watch items - not findings today, serious if they change
+
+Two conditions worth re-checking periodically, because both would become severe
+and both are invisible unless you look:
+
+- **LA9 - `trust.lithicblue.com`** is a CNAME to `cname.vantatrust.com` (16.4). If
+  LithicBlue ever ends its Vanta subscription while that CNAME remains, the
+  hostname becomes claimable. And because the CSP trusts
+  `script-src https://*.lithicblue.com` (16.3), control of **any** subdomain means
+  script execution on the application's origin. A routine subdomain takeover
+  becomes application compromise here.
+- **LA10 - `auth.lithicblue.com`** holds certificates in CT logs (12 of them, to
+  2026-06) but has **no DNS record** (16.4, 17.1). Nothing to take over today. If
+  it is ever re-pointed at an unclaimed provider, the same CSP logic applies.
+
+Re-check both monthly. A one-line note to them about the CSP consequence of
+`*.lithicblue.com` being a trusted script source is reasonable now, as hardening
+advice rather than a bounty submission.
+
+## 23.6 Human-mediated processes
+
+Some operations are deliberately handled by staff rather than self-service. Those
+are rarely threat-modelled.
+
+- **LA11 - Region migration.** "Region changes are handled by our team rather than
+  self-service, because they involve migrating your organization's data"
+  (`/docs/hosting/changing-region`). A bulk data move between regions, executed by
+  a human, touching every object in an organisation. Questions worth asking (do
+  not attempt to trigger one against a real tenant): is data readable from the old
+  region during or after the move? Do share links, MCP tokens and presigned URLs
+  survive it pointing at the old region? Is the source copy deleted? If you can
+  get a test organisation migrated, this is an unusually rich target.
+- **LA12 - In-region AI processing** is "enabled for your organization on request",
+  so it is a per-org flag (`/docs/hosting/data-residency`). Test who can read or
+  write that flag - a Member toggling an organisation's data-residency setting
+  would be a permission-control circumvention with compliance consequences for
+  their regulated customers.
+- **LA13 - Dedicated hosting** is offered for firms with isolation requirements
+  (`/docs/hosting/regions`). Dedicated tenancy means a separate deployment path -
+  worth asking whether those instances are in programme scope at all.
+
+## 23.7 Email as an attack channel
+
+Microsoft 365 handles their mail (16.4), and several flows depend on email.
+
+- **LA14 - Header and content injection in invitations.** You control the invited
+  address field. Test newlines, encoded CRLF, long values and display-name
+  constructs - and whether your own attacker-controlled strings (organisation
+  name, project name, your display name) land unescaped in the HTML of an email
+  sent to a third party.
+- **LA15 - Invitation-flow identity confusion.** Combine with A1: change your
+  account's email to one with a pending invitation elsewhere, then accept.
+  Separately, test whether an invitation addressed to `alice@x.com` can be
+  accepted by a session belonging to someone else.
+- **LA16 - The emailed deliverable link** (INT5) is an authorization decision made
+  at send time and exercised later. Check its entropy, whether it works
+  unauthenticated, and whether it still works after you leave the organisation.
+
+## 23.8 What I am not going to help with
+
+Worth stating plainly so the boundary is unambiguous:
+
+- Testing assets that are **not** LithicBlue-owned. Tavily, PostHog, Vanta, Vercel,
+  PlanetScale, Fly.io, Stripe and Temporal appear in their stack, and their
+  sub-processor list tells you so - but they are other companies' systems. Their
+  programme excludes third-party services, and their MSA says "Services exclude
+  any products or services provided by third parties" (19.1). Hitting a
+  sub-processor is not in-scope research.
+- The **customers'** Google Workspaces and Microsoft tenants reachable through
+  domain-wide delegation. Test LithicBlue's *handling* of delegated access using a
+  Workspace you own; never reach into a real customer's tenant.
+- Anything against **real customer organisations**, including read-only probing of
+  their objects. Their policy: never attempt to access anyone else's data.
+- Social engineering of staff, DoS, and the rest of their exclusion list - not
+  because they are hard, but because they are explicitly excluded, so they earn
+  nothing and cost you the relationship.
+
+The reason to hold this line is practical, not moral. You have eight reports with
+this programme. An out-of-scope test is the fastest way to lose that standing, and
+with no safe-harbour clause in their terms the legal exposure is personal.
