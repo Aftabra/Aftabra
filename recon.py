@@ -24,6 +24,8 @@ import os
 import re
 import socket
 import ssl
+import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -119,7 +121,7 @@ class Limiter:
             time.sleep(delay)
 
 
-def http_get(url, ua=DEFAULT_UA, headers=None, timeout=20, limiter=None,
+def http_get_urllib(url, ua=DEFAULT_UA, headers=None, timeout=20, limiter=None,
              max_bytes=MAX_BYTES, insecure=False):
     """Returns dict(status, url, headers, body, err). Never raises."""
     if limiter:
@@ -160,6 +162,61 @@ def http_get(url, ua=DEFAULT_UA, headers=None, timeout=20, limiter=None,
         except Exception:
             pass
     return out
+
+
+def http_get_curl(url, ua=DEFAULT_UA, headers=None, timeout=20, limiter=None,
+                  max_bytes=MAX_BYTES, insecure=False):
+    """curl transport. Required where the session has no local resolver and all
+    egress is a CONNECT proxy. Same contract as http_get_urllib."""
+    if limiter:
+        limiter.wait()
+    out = {"status": None, "url": url, "headers": {}, "body": b"", "err": None}
+    bf = tempfile.NamedTemporaryFile(delete=False, suffix=".body"); bf.close()
+    hf = tempfile.NamedTemporaryFile(delete=False, suffix=".hdr"); hf.close()
+    cmd = ["curl", "-sS", "-L", "--max-redirs", "5", "--max-time", str(timeout),
+           "--compressed", "-A", ua, "-D", hf.name, "-o", bf.name,
+           "-w", "%{http_code} %{url_effective}"]
+    if insecure:
+        cmd.append("-k")
+    for k, v in (headers or {}).items():
+        cmd += ["-H", f"{k}: {v}"]
+    cmd.append(url)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout + 20)
+        meta = proc.stdout.decode("utf-8", "replace").strip().split()
+        if meta and meta[0].isdigit() and meta[0] != "000":
+            out["status"] = int(meta[0])
+            if len(meta) > 1:
+                out["url"] = meta[1]
+        else:
+            out["err"] = (proc.stderr.decode("utf-8", "replace").strip()
+                          or "curl: no response")[:200]
+        with open(bf.name, "rb") as fh:
+            out["body"] = fh.read(max_bytes)
+        with open(hf.name, "r", errors="replace") as fh:
+            for line in fh:
+                if ":" in line and not line.startswith(("HTTP/", " ", "\t")):
+                    k, v = line.split(":", 1)
+                    out["headers"][k.strip().lower()] = v.strip()
+    except Exception as e:
+        out["err"] = f"{type(e).__name__}: {e}"
+    finally:
+        for f in (bf.name, hf.name):
+            try:
+                os.unlink(f)
+            except Exception:
+                pass
+    return out
+
+
+TRANSPORT = {"mode": "curl"}
+
+
+def http_get(*args, **kwargs):
+    if TRANSPORT["mode"] == "curl":
+        return http_get_curl(*args, **kwargs)
+    return http_get_urllib(*args, **kwargs)
+
 
 
 def pool(items, fn, workers=12):
@@ -311,7 +368,10 @@ def classify(host):
     try:
         canon, aliases, ips = socket.gethostbyname_ex(host)
     except Exception:
-        return None, [], "dead"
+        # No local resolver (proxy-only egress). Cannot read the CNAME chain
+        # here, so fall through to HTTP-response fingerprinting instead of
+        # declaring the host dead.
+        return None, [], "unknown"
     chain = [c.lower().rstrip(".") for c in ([canon] + list(aliases)) if c]
     chain = [c for c in dict.fromkeys(chain) if c != host.lower()]
     blob = " ".join(chain + [canon.lower()])
@@ -324,6 +384,38 @@ def classify(host):
     return (ips[0] if ips else None), chain, "self"
 
 
+SAAS_BODY_HINTS = (
+    (b"zendesk", "zendesk"), (b"statuspage.io", "statuspage"),
+    (b"hs-scripts.com", "hubspot"), (b"hubspot", "hubspot"),
+    (b"squarespace", "squarespace"), (b"wix.com", "wix"),
+    (b"webflow", "webflow"), (b"wp-content", "wordpress"),
+    (b"myshopify", "shopify"), (b"intercom", "intercom"),
+    (b"marketo", "marketo"), (b"pardot", "pardot"),
+    (b"freshdesk", "freshdesk"), (b"typeform", "typeform"),
+    (b"atlassian.net", "atlassian"), (b"readthedocs", "readthedocs"),
+    (b"gitbook", "gitbook"), (b"unbounce", "unbounce"),
+)
+
+
+def fingerprint_http(row):
+    """Label a probed host as third-party from its HTTP response, for use when
+    no resolver is available to read the CNAME chain."""
+    host_final = (urlsplit(row.get("final_url") or "").hostname or "").lower()
+    server = (row.get("server") or "").lower()
+    if host_final and not host_final.endswith(".lithero.com") and host_final != "lithero.com":
+        for suf in SAAS_SUFFIXES:
+            if host_final.endswith(suf.lstrip(".")) or suf in host_final:
+                return "third-party", f"redirects to {host_final}"
+        for suf in CDN_SUFFIXES:
+            if suf in host_final:
+                return "cdn", f"redirects to {host_final}"
+        return "offsite", f"redirects to {host_final}"
+    for suf in SAAS_SUFFIXES:
+        if suf.lstrip(".").split(".")[0] in server:
+            return "third-party", f"server: {server}"
+    return row.get("kind", "unknown"), ""
+
+
 def cmd_probe(args, scope, hosts=None):
     hosts = hosts or read_lines(args.hosts)
     hosts = [h for h in hosts if scope.allows(h)]
@@ -334,6 +426,9 @@ def cmd_probe(args, scope, hosts=None):
     log(f"resolving {len(hosts)} host(s) (DNS only, no traffic to target)...")
     resolved = pool(hosts, lambda h: (h,) + classify(h), args.workers)
     live_dns = [r for r in resolved if r[3] != "dead"]
+    if all(r[3] == "unknown" for r in live_dns) and live_dns:
+        warn("no local resolver - CNAME classification unavailable; "
+             "falling back to HTTP response fingerprinting after probe")
     third = [r for r in live_dns if r[3] == "third-party"]
     probe_set = live_dns if args.probe_third_party else [r for r in live_dns
                                                         if r[3] != "third-party"]
@@ -370,6 +465,18 @@ def cmd_probe(args, scope, hosts=None):
 
     rows = pool([h for h, _i, _c, _k in probe_set], one, args.workers)
     alive = sorted([r for r in rows if r["status"]], key=lambda r: r["host"])
+    for r in alive:
+        kind, why = fingerprint_http(r)
+        r["kind"], r["kind_reason"] = kind, why
+    late = [r for r in alive if r["kind"] == "third-party"]
+    if late:
+        warn(f"{len(late)} probed host(s) fingerprint as third-party SaaS "
+             "(Lithero terms s1) - do not test these:")
+        for r in late:
+            warn(f'  {r["host"]} ({r["kind_reason"]})')
+        with open(os.path.join(args.out, "third-party-subdomains.txt"), "a") as fh:
+            for r in late:
+                fh.write(f'{r["host"]}  ->  {r["kind_reason"]}\n')
     write_json(os.path.join(args.out, "probe.json"), alive)
     urls = [r["final_url"] or f'{r["scheme"]}://{r["host"]}/' for r in alive]
     write_lines(os.path.join(args.out, "alive.txt"), urls)
@@ -702,6 +809,9 @@ def main():
     ap.add_argument("--probe-third-party", action="store_true",
                     help="also probe hosts that CNAME to third-party SaaS "
                          "(Lithero terms s1 excludes third-party services)")
+    ap.add_argument("--transport", choices=("curl", "urllib"), default="curl",
+                    help="HTTP backend; curl is required where the session has "
+                         "no resolver and egress is a CONNECT proxy")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("subs", help="passive subdomain enumeration")
@@ -727,6 +837,7 @@ def main():
     p.add_argument("--max-pages", type=int, default=400)
 
     args = ap.parse_args()
+    TRANSPORT["mode"] = args.transport
     os.makedirs(args.out, exist_ok=True)
     scope = Scope.load(args.scope)
     log(f"scope: in={scope.allow} out={scope.deny or '[]'}  rps={args.rps}")
