@@ -210,6 +210,7 @@ def http_get_curl(url, ua=DEFAULT_UA, headers=None, timeout=20, limiter=None,
 
 
 TRANSPORT = {"mode": "curl"}
+SCOPE_REF = {"scope": None}
 
 
 def http_get(*args, **kwargs):
@@ -402,7 +403,7 @@ def fingerprint_http(row):
     no resolver is available to read the CNAME chain."""
     host_final = (urlsplit(row.get("final_url") or "").hostname or "").lower()
     server = (row.get("server") or "").lower()
-    if host_final and not host_final.endswith(".lithero.com") and host_final != "lithero.com":
+    if host_final and not SCOPE_REF["scope"].allows(host_final):
         for suf in SAAS_SUFFIXES:
             if host_final.endswith(suf.lstrip(".")) or suf in host_final:
                 return "third-party", f"redirects to {host_final}"
@@ -484,7 +485,8 @@ def cmd_probe(args, scope, hosts=None):
         f"{len(probe_set)} probed -> {len(alive)} alive")
     for r in alive[:60]:
         tag = "" if r["kind"] == "self" else f' [{r["kind"]}]'
-        log(f'  {r["status"]} {r["final_url"]:<58}{tag} {r["title"][:46]}')
+        arrow = "" if r["final_url"].rstrip("/").endswith(r["host"]) else f' -> {r["final_url"]}'
+        log(f'  {r["status"]} {r["host"]:<30}{arrow}{tag} {r["title"][:40]}')
     return urls
 
 
@@ -818,15 +820,18 @@ def main():
     p.add_argument("domain", nargs="+")
 
     p = sub.add_parser("probe", help="which hosts are alive")
-    p.add_argument("--hosts", default="out/subdomains.txt")
+    p.add_argument("--hosts", default=None,
+                   help="default: <out>/subdomains.txt")
 
     p = sub.add_parser("crawl", help="walk pages, collect JS urls")
-    p.add_argument("--seeds", default="out/alive.txt")
+    p.add_argument("--seeds", default=None,
+                   help="default: <out>/alive.txt")
     p.add_argument("--depth", type=int, default=2)
     p.add_argument("--max-pages", type=int, default=400)
 
     p = sub.add_parser("js", help="download JS assets")
-    p.add_argument("--urls", default="out/js-urls.txt")
+    p.add_argument("--urls", default=None,
+                   help="default: <out>/js-urls.txt")
 
     sub.add_parser("maps", help="fetch source maps, rebuild original sources")
     sub.add_parser("endpoints", help="mine downloaded JS/sources")
@@ -839,7 +844,12 @@ def main():
     args = ap.parse_args()
     TRANSPORT["mode"] = args.transport
     os.makedirs(args.out, exist_ok=True)
+    for attr, name in (("hosts", "subdomains.txt"), ("seeds", "alive.txt"),
+                       ("urls", "js-urls.txt")):
+        if getattr(args, attr, "sentinel") is None:
+            setattr(args, attr, os.path.join(args.out, name))
     scope = Scope.load(args.scope)
+    SCOPE_REF["scope"] = scope
     log(f"scope: in={scope.allow} out={scope.deny or '[]'}  rps={args.rps}")
 
     if args.cmd == "subs":

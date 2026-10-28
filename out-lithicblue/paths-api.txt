@@ -1,0 +1,9 @@
+/account
+/addin/auth/done
+/admin
+/api/auth
+/api/surveys/
+/api/trpc
+/docs/account
+/i/v1/logs
+/i/v1/metrics

@@ -1,0 +1,86 @@
+[
+  {
+    "cname": [],
+    "final_url": "https://www.lithicblue.com/landing",
+    "host": "au.lithicblue.com",
+    "ip": null,
+    "kind": "offsite",
+    "kind_reason": "redirects to www.lithicblue.com",
+    "scheme": "https",
+    "server": "cloudflare",
+    "status": 200,
+    "title": "LithicBlue | LithicBlue"
+  },
+  {
+    "cname": [],
+    "final_url": "https://www.lithicblue.com/landing",
+    "host": "eu.lithicblue.com",
+    "ip": null,
+    "kind": "offsite",
+    "kind_reason": "redirects to www.lithicblue.com",
+    "scheme": "https",
+    "server": "cloudflare",
+    "status": 200,
+    "title": "LithicBlue | LithicBlue"
+  },
+  {
+    "cname": [],
+    "final_url": "https://www.lithicblue.com/landing",
+    "host": "lithicblue.com",
+    "ip": null,
+    "kind": "offsite",
+    "kind_reason": "redirects to www.lithicblue.com",
+    "scheme": "https",
+    "server": "cloudflare",
+    "status": 200,
+    "title": "LithicBlue | LithicBlue"
+  },
+  {
+    "cname": [],
+    "final_url": "https://www.lithicblue.com/landing",
+    "host": "na.lithicblue.com",
+    "ip": null,
+    "kind": "offsite",
+    "kind_reason": "redirects to www.lithicblue.com",
+    "scheme": "https",
+    "server": "cloudflare",
+    "status": 200,
+    "title": "LithicBlue | LithicBlue"
+  },
+  {
+    "cname": [],
+    "final_url": "https://proxy.lithicblue.com/",
+    "host": "proxy.lithicblue.com",
+    "ip": null,
+    "kind": "offsite",
+    "kind_reason": "redirects to proxy.lithicblue.com",
+    "scheme": "https",
+    "server": "cloudflare",
+    "status": 403,
+    "title": "DNS points to prohibited IP | proxy.lithicblue.com | Cloudflare"
+  },
+  {
+    "cname": [],
+    "final_url": "https://trust.lithicblue.com/",
+    "host": "trust.lithicblue.com",
+    "ip": null,
+    "kind": "offsite",
+    "kind_reason": "redirects to trust.lithicblue.com",
+    "scheme": "https",
+    "server": "cloudflare",
+    "status": 200,
+    "title": "LithicBlue Trust Center"
+  },
+  {
+    "cname": [],
+    "final_url": "https://www.lithicblue.com/landing",
+    "host": "www.lithicblue.com",
+    "ip": null,
+    "kind": "offsite",
+    "kind_reason": "redirects to www.lithicblue.com",
+    "scheme": "https",
+    "server": "cloudflare",
+    "status": 200,
+    "title": "LithicBlue | LithicBlue"
+  }
+]

@@ -1,0 +1,17 @@
+{
+  "_comment": [
+    "LithicBlue Vulnerability Reward Program.",
+    "Scope per the published policy: web services owned by LithicBlue that",
+    "handle sensitive user data, 'e.g. properties hosted on https://*.lithicblue.com'.",
+    "",
+    "NOTE: the policy excludes findings produced by automated scanners or AI",
+    "tooling. Use this only to MAP attack surface. Vulnerability discovery must",
+    "be original manual research, and marketing pages that handle no sensitive",
+    "user data are outside the qualification criteria."
+  ],
+  "in_scope": [
+    "lithicblue.com",
+    "*.lithicblue.com"
+  ],
+  "out_of_scope": []
+}
