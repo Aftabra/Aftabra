@@ -1572,3 +1572,197 @@ revenue loss - not merely a cosmetic unlock.
    anything that is not yours.
 5. Try each action's ID while POSTing to an unauthenticated route such as
    `/login` (SA4) - action IDs are generally not bound to the route that uses them.
+
+---
+
+# 22. Reverse engineering the client bundles
+
+Analysis of the bundles already collected. Minification mangles identifiers but
+preserves string literals, property names and control flow, which is enough.
+
+**Scope caveat worth settling.** Their MSA's acceptable-use clause restricts
+reverse engineering ("(d) reverse engineer, att…"). That clause binds *Customers*
+under an Order Form, and the VRP - a separate document that solicits security
+research and demands "original, manual research" - does not list it as excluded.
+Reading JavaScript the browser is served is ordinary research practice. Still, add
+it to the scope email (19.2): ask whether client-code analysis is acceptable.
+Lithero's programme granted this explicitly; LithicBlue's is silent.
+
+## 22.1 The paid-tier gate, decompiled
+
+Two independent call sites, de-minified:
+
+```js
+// login redirect logic
+let allowed = "paid" === user.userTier || "admin" === user.role;
+window.location.href = next || fallback || (allowed ? APP : "/upgrade");
+
+// navigation component
+const isPaid = user?.userTier === "paid";
+```
+
+So entitlement is `user.userTier === "paid"` **OR** `user.role === "admin"`.
+
+Two consequences:
+
+- **`userTier` is the field name and `"paid"` is the value.** Combined with the
+  `clearUserTierCookie` Server Action (21.4), entitlement is cached client-side.
+  TC1 now has concrete values to forge.
+- **`role === "admin"` also satisfies the paid gate.** So E1 chains: assign
+  yourself `role: "admin"` and you get platform admin *and* paid-tier features,
+  the MCP connector among them (I7/M3). One field, two escalations.
+
+## 22.2 E1 refined - `userTier` is the better target, and here's why
+
+The bundle contains Better Auth's error table, which includes:
+
+```
+FIELD_NOT_ALLOWED            "Field not allowed to be set"
+```
+
+That is Better Auth's **field allowlist** rejection. The library only accepts
+fields declared in its `additionalFields` config, and only where that declaration
+permits client input. So E1 has a precise, binary outcome:
+
+- `FIELD_NOT_ALLOWED` -> the allowlist is doing its job for that field. Note it
+  and move on.
+- success -> the field was declared client-writable.
+
+**And `userTier` is almost certainly an app-defined `additionalFields` entry**,
+whereas `role` arrives from the admin plugin's own schema. App-defined custom
+fields are the ones developers routinely declare with input enabled, because they
+set them from their own code and forget the client can too.
+
+**So reorder the E1 attempts:**
+
+1. `userTier: "paid"` - most likely to succeed, immediate paid-feature access
+2. `role: "admin"` - bigger prize (admin plugin + paid gate), likelier to be blocked
+3. `emailVerified: true`, `banned: false` - other plugin-schema fields
+
+Each via every write path: the Better Auth update route, the tRPC user mutation,
+**and the Server Actions** (SA3), since an action may not route through Better
+Auth's allowlist at all. That last point matters - the allowlist protects Better
+Auth's endpoints, not the app's own actions.
+
+## 22.3 The admin console is gated client-side
+
+From the navigation chunk:
+
+```js
+const { user } = useAuth();
+const isAdmin = user?.role === "admin";
+// ... nav items assembled conditionally
+```
+
+The admin area's **visibility** is decided in the browser, from a field on the
+session object. That is normal for a UI, but it means:
+
+- The `/admin` route exists (it responds differently from a nonexistent path,
+  15.5) and its server-side protection is a separate question from this check.
+- If `userTier`/`role` is client-writable (22.2), the nav appears - and then the
+  only thing standing between you and the admin console is whatever the server
+  enforces on those routes and their data loaders.
+
+Test `/admin`, `/admin/users`, `/admin/oauth/clients`, `/admin/custom-providers`
+and `/admin/generate_link` directly as a plain Member, and request their `?_rsc=`
+payloads too (SA6) - an RSC payload can carry data the component would not render.
+
+## 22.4 Legacy route manifest - 18 routes, ~8 undocumented feature areas
+
+An archived bundle embeds the full client route table with regexes and parameter
+names. Saved to **`lithicblue/legacy-routes.txt`**.
+
+```
+/articles/:slug                 /chat/:engagementId
+/articles/edit/:id              /document_template/:id
+/articles/preview/:id           /documents/:id
+/documents/edit/:docId          /documents/list/:engagementId
+/engagement/:engagementId       /exemplar/:id
+/invite/:token                  /kag/:engagementId
+/libraries/datagaps/:id         /libraries/persona/:id
+/methods/list/:engagementId     /methods/result/:id
+/methods/template/:id           /view/:engagementId/:fileId
+```
+
+Param names in use: `docId`, `engagementId`, `fileId`, `id`, `slug`, `token`.
+
+Features here that appear in **no published documentation**:
+
+| Route | Feature | Why it matters |
+|---|---|---|
+| `/chat/:engagementId` | conversational interface over a project | the docs say "ask questions across the documents" but never expose a chat route. Prompt-injection and cross-project context surface. |
+| `/methods/list`, `/methods/template`, `/methods/result` | **"methods"** - the structured-analysis methodology | "run structured analysis using your methodology". Templates are user-authored logic; `/methods/result/:id` is an object id to test cross-org. |
+| `/libraries/persona/:id` | a **persona** library | AI personas are prompt content. A shared persona library is a cross-tenant prompt-injection vector if personas are shared or ids are guessable. |
+| `/libraries/datagaps/:id` | data-gap library | |
+| `/exemplar/:id` | **exemplars** - reference deliverables | likely shared across orgs; test whether yours leak or theirs are readable |
+| `/document_template/:id` | document templates | template injection candidate; also shared-object risk |
+| `/documents/edit/:docId` | in-app document editing | write surface distinct from upload |
+| **`/articles/edit/:id`**, `/articles/preview/:id` | **an in-app article CMS** | see 22.5 |
+
+**These are legacy paths** from the pre-rename build, so most will 404 today. Two
+things to do with them:
+
+- **RE1** Try each verbatim - legacy aliases sometimes survive a rename (L1), and
+  these come with real `:id` parameter positions.
+- **RE2** Try each with `:projectId` substituted for `:engagementId`
+  (`/chat/<projectId>`, `/methods/list/<projectId>`, `/kag/<projectId>`). `/kag/`
+  and `/view/` already carry over to the current build, so the pattern holds. Each
+  surviving route is an object-authorization test with a foreign id.
+
+## 22.5 The article CMS is the most interesting legacy find
+
+`/articles/edit/:id` and `/articles/preview/:id` are an **in-application content
+editor** for the public marketing site - `www.lithicblue.com/articles` serves four
+live posts, and these routes edit them.
+
+Why that is worth real attention:
+
+1. It is a **content-injection surface on a first-party origin**.
+2. The CSP (16.3) sets `script-src 'self' 'unsafe-inline' https://*.lithicblue.com`.
+   So script injected into a page on any `lithicblue.com` host executes - CSP will
+   not contain it.
+3. Published articles are read by prospects and customers on the marketing site.
+
+So if the editor's authorization is weak - reachable by an ordinary account, or by
+a user in any organisation - the chain is: edit an article -> inject script ->
+execute in every visitor's browser on a trusted origin. Test who can reach
+`/articles/edit/:id` (and its current-build equivalent), whether preview renders
+unsanitised input, and whether article ids are enumerable.
+
+## 22.6 What the Better Auth error table tells us is configured
+
+The full table is in the bundle. Entries worth noting - several are *good* news
+and should save you time:
+
+| Code | Reading |
+|---|---|
+| `CROSS_SITE_NAVIGATION_LOGIN_BLOCKED` - "This request appears to be a CSRF attack" | CSRF protection on login is present |
+| `INVALID_ORIGIN`, `MISSING_OR_NULL_ORIGIN` | origin checking is enforced |
+| `INVALID_CALLBACK_URL`, `INVALID_REDIRECT_URL`, `INVALID_ERROR_CALLBACK_URL`, `INVALID_NEW_USER_CALLBACK_URL` | redirect/callback validation exists - tempers O1, though the *registration* redirect_uri path is separate and still worth testing |
+| `SESSION_NOT_FRESH` - "Session is not fresh" | freshness is required for sensitive operations (relevant to O7) |
+| `FIELD_NOT_ALLOWED` | the field allowlist discussed in 22.2 |
+| `EMAIL_CAN_NOT_BE_UPDATED`, `EMAIL_MISMATCH`, `VERIFICATION_EMAIL_NOT_ENABLED`, `EMAIL_ALREADY_VERIFIED` | email-change controls exist; A1 should check *which* are actually enabled |
+| `USER_ALREADY_EXISTS` / `..._USE_ANOTHER_EMAIL` | **signup discloses whether an email is registered** - account enumeration. Weak alone and arguably below their severity threshold, but it is not in their exclusion list, and it chains (it tells you which addresses belong to a target organisation). Bank it for a combined report under their "several findings in concert" clause. |
+| `FAILED_TO_UNLINK_LAST_ACCOUNT`, `USER_ALREADY_HAS_PASSWORD`, `PASSWORD_ALREADY_SET`, `SOCIAL_ACCOUNT_ALREADY_LINKED`, `LINKED_ACCOUNT_ALREADY_EXISTS` | **account linking is enabled** - a surface not in the docs. Account-linking flows are a classic takeover path: link a social account to a victim's record, or pre-link an unverified email. Worth its own test pass. |
+
+**New item - AL1: account linking.** The presence of link/unlink errors means
+social account linking exists. Test whether an account can be linked using an
+email that is not verified, whether linking is possible to an address belonging to
+another user, and whether a linked provider can then authenticate into the
+original account. This is how a Google/Microsoft SSO identity can become a path
+into an email/password account.
+
+## 22.7 Revised priorities after RE
+
+1. **22.2** `userTier: "paid"` mass assignment, then `role: "admin"` - via Better Auth, tRPC **and** Server Actions
+2. **PS2** `getPresignedUpdateUrl` with a foreign object key (21.2)
+3. **TC1** forge the tier cookie (`userTier`/`"paid"`) and find a server-side gate reading it (21.4)
+4. **DWD1/DWD2** Drive domain-wide-delegation impersonation (17.3)
+5. **SA1-SA4** Server Action authorization sweep across the 24 actions (20.2, 21)
+6. **RE2** legacy routes re-tried with `projectId` - `/chat`, `/methods`, `/libraries/persona`, `/exemplar`, `/document_template` (22.4)
+7. **22.5** article CMS authorization -> stored XSS on a first-party origin
+8. **AL1** account linking takeover paths (22.6)
+9. **RC1/RC2** `lb_region` tampering; session cookie domain scope (16.2)
+10. **C1/C2/P2** object-id authorization across organisations (6, 15.1)
+11. **TW1** revocation during an in-flight Temporal workflow (20.4)
+12. **R5** research-controls merge bypass, confirmed out of band (15.2, 20.3)

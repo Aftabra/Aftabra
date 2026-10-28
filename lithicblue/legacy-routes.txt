@@ -1,0 +1,23 @@
+# LithicBlue LEGACY route manifest
+# Recovered from an archived client bundle (pre-rename build, Internet Archive).
+# These use engagementId; the current build renamed engagement -> project.
+# Try each with :projectId in place of :engagementId on na/eu/au.
+
+/articles/:slug                          ^/articles/([^/]+)$
+/articles/edit/:id                       ^/articles/edit/([^/]+)$
+/articles/preview/:id                    ^/articles/preview/([^/]+)$
+/chat/:engagementId                      ^/chat/([^/]+)$
+/document_template/:id                   ^/document_template/([^/]+)$
+/documents/:id                           ^/documents/([^/]+)$
+/documents/edit/:docId                   ^/documents/edit/([^/]+)$
+/documents/list/:engagementId            ^/documents/list/([^/]+)$
+/engagement/:engagementId                ^/engagement/([^/]+)$
+/exemplar/:id                            ^/exemplar/([^/]+)$
+/invite/:token                           ^/invite/([^/]+)$
+/kag/:engagementId                       ^/kag/([^/]+)$
+/libraries/datagaps/:id                  ^/libraries/datagaps/([^/]+)$
+/libraries/persona/:id                   ^/libraries/persona/([^/]+)$
+/methods/list/:engagementId              ^/methods/list/([^/]+)$
+/methods/result/:id                      ^/methods/result/([^/]+)$
+/methods/template/:id                    ^/methods/template/([^/]+)$
+/view/:engagementId/:fileId              ^/view/([^/]+)/([^/]+)$
