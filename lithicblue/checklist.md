@@ -158,6 +158,18 @@ Status key: ` ` untested · `~` in progress · `P` pass (no issue) · `F` findin
 [ ] SB7  Is the decommissioned Supabase project still live
 ```
 
+## Injection (§27)
+```
+[ ] 27.3      admin/list-users sortBy / filterField structural injection
+[ ] 27.5a     Structural positions (column-name params)
+[ ] 27.5b     Value positions - error-based and boolean only, no time-based
+[ ] 27.5c     Numeric positions (limit, offset, numeric ids)
+[ ] 27.5d     LIKE wildcard widening a scoped search -> cross-org read
+[ ] SQLI-ORM1 ORM operator objects in place of scalars   <- most likely on this stack
+[ ] SQLI-ORM2 Type juggling in procedure inputs
+[ ] SQLI-ORM3 Extra keys passed through into queries/writes
+```
+
 ## Watch items - re-check monthly
 ```
 [ ] LA9  trust.lithicblue.com CNAME to Vanta - takeover if subscription lapses

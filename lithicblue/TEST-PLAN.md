@@ -2453,3 +2453,175 @@ Shaped by 26.1 - the one-layer model means data-layer authorization dominates:
 Dropped or downgraded: SA6 (no RSC disclosure), AD1-AD3 (no evidence of an
 add-in), SB1-SB6 (Supabase gone), BD1 (no regional code drift), `?dpl=` pinning,
 `/_next/image` arbitrary-host SSRF, MCP transport variants.
+
+---
+
+# 27. SQL injection - honest assessment and the narrow surface worth testing
+
+## 27.1 What the bundles say: nothing
+
+Searched all 185 collected bundles for ORM and driver signatures (Drizzle, Prisma,
+`@planetscale/database`, mysql2, Kysely, Knex, Sequelize, TypeORM), raw-SQL escape
+hatches (`$queryRawUnsafe`, `executeRawUnsafe`, `sql.raw`, `sql\``), SQL keywords
+and database error strings. **Zero hits for all of it.**
+
+That is the correct result - the database layer is server-side only and never
+shipped to the browser - but it means the query builder cannot be identified from
+outside. The `"select"`, `"query"`, `"cursor"`, `"page"` and `"offset"` strings
+that do appear are React props, TanStack Query internals and CSS.
+
+## 27.2 Why classic SQLi is unlikely here - and why that is worth saying
+
+Do not sink days into this. The architecture argues against it:
+
+- **PlanetScale with TypeScript means an ORM**, almost certainly Drizzle or Prisma
+  (Better Auth ships adapters for both, and they use Better Auth). Both
+  parameterise by default. Injection requires a developer to have reached for an
+  escape hatch.
+- **The PlanetScale serverless driver executes one statement per request.** Stacked
+  queries - `'; DROP TABLE …` - do not work. That removes the entire category most
+  payload lists are built around.
+- **Vitess is not plain MySQL.** Cross-shard behaviour, partial
+  `information_schema` support and rejected constructs make even successful
+  injection awkward to exploit.
+- **And the real point:** this target's authorization model is one layer thick
+  (26.1). A missing check in a tRPC procedure is a cross-organisation read that
+  takes one request to demonstrate. That is strictly better use of your time than
+  hunting injection behind an ORM. The architecture tells you where the bugs are.
+
+So: test the narrow surface below, bank the result either way, and move on.
+
+## 27.3 Where injection could actually live on this stack
+
+Injection on a parameterised ORM lives in the positions that **cannot** be
+parameterised, because those get string-interpolated:
+
+- **`ORDER BY` column and direction.** A column name is not a bindable parameter,
+  so it is either allowlisted or concatenated. This is the single most common real
+  SQLi in modern TypeScript applications.
+- **Column names in dynamic filters.** Same reason.
+- **`LIMIT` / `OFFSET`.** Often interpolated as numbers without validation.
+- **Full-text search** (`MATCH … AGAINST`) if document search is SQL-backed
+  rather than vector-based.
+- **Raw escape hatches** - `sql.raw()`, `$queryRawUnsafe` - used for a reporting
+  query, an aggregate, or a migration-style operation.
+
+**The concrete known surface: Better Auth's `admin/list-users`.** Confirmed to
+exist (401, §15.6). Its documented parameters include `searchField`,
+`searchOperator`, `searchValue`, `filterField`, `filterOperator`, `filterValue`,
+`sortBy`, `sortDirection`, `limit`, `offset`. Note what several of those are:
+**column names and operators** - values that become query *structure*, not query
+*data*. Better Auth constrains them, but this is the one endpoint known to accept
+structural input.
+
+Test it the moment E1 (22.2) gives you an account that can call it:
+
+```
+GET /api/auth/admin/list-users?sortBy=email&sortDirection=asc&limit=10
+```
+
+then vary `sortBy` and `filterField` to a non-column value and read the error.
+
+## 27.4 Test method, tuned to their exclusions
+
+Order matters, because one detection method is effectively banned:
+
+1. **Error-based first.** Send a value that would break SQL syntax if
+   interpolated - a bare single quote, an unbalanced parenthesis, a backslash - and
+   read the response. A 500 with a parse error, or any message naming a column or
+   table, is the finding. One request per parameter.
+2. **Differential/boolean second.** Compare `sortBy=email` against
+   `sortBy=email, (select 1)` and against a nonsense column. Three distinct
+   responses - ordered result, same result, error - tell you whether the value
+   reaches the query planner.
+3. **Do not use time-based blind.** `SLEEP()` and heavy `BENCHMARK()` probing is
+   slow, needs many requests, and lands squarely in their exclusions: "denial of
+   service attacks, including but not limited to… rate limiting". Even a successful
+   time-based finding would arrive looking like the traffic they refuse to triage.
+   If a parameter is injectable, error-based or boolean will show it.
+4. **Never attempt `UNION SELECT` against real tables** to prove data access. If
+   you establish injection, stop there and report the injection point with the
+   syntax error as evidence. Pulling rows means pulling their customers' data,
+   which their policy forbids outright.
+
+## 27.5 MySQL/Vitess-appropriate probes
+
+A handful of values, each testing one idea. Not a wordlist.
+
+**Structural positions** (`sortBy`, `filterField`, any column-name parameter):
+
+| Value | Tests |
+|---|---|
+| `email` | baseline, valid column |
+| `nonexistent_column` | error shape - does it name real columns? |
+| `email,id` | whether a comma-separated list is accepted |
+| `email ASC, (SELECT 1)` | subquery acceptance in ORDER BY |
+| `(CASE WHEN 1=1 THEN email ELSE id END)` | expression acceptance |
+| `` email` `` | backtick-quoting confusion |
+| `email--` | comment handling |
+
+**Value positions** (`searchValue`, `filterValue`, and any string filter):
+
+| Value | Tests |
+|---|---|
+| `'` | the classic syntax break |
+| `\` | escape handling, often missed where quotes are filtered |
+| `a' OR '1'='1` | boolean, only to compare result counts |
+| `a'||'b` and `a' 'b` | MySQL string concatenation behaviour |
+| `0x61` | hex literal interpretation |
+| `%` and `_` | LIKE-wildcard injection - weaker, but real: it can widen a search past its intended scope |
+
+**Numeric positions** (`limit`, `offset`, `page`, any id expected to be a number):
+
+| Value | Tests |
+|---|---|
+| `-1`, `0` | sign and zero handling |
+| `99999999999999999999` | overflow |
+| `1e3` | scientific notation coercion |
+| `1 OR 1=1` | unquoted numeric interpolation |
+
+Note `%` / `_` wildcard injection specifically: on a search that filters by
+organisation, a wildcard that widens the LIKE pattern is not classic SQLi but can
+still return rows beyond the intended scope. That outcome is a
+**cross-organisation read**, which is their top tier - so judge the finding by
+what came back, not by whether it technically counts as injection.
+
+## 27.6 The more likely injection class on this stack: ORM operator injection
+
+This is where to actually look, and almost nobody does.
+
+Modern ORMs accept **structured filter objects**. If a procedure passes
+user-supplied JSON into a `where` clause without validating its shape, a caller can
+substitute an *operator object* for a scalar:
+
+```
+expected:  { "projectId": "abc" }
+sent:      { "projectId": { "not": "" } }          // Prisma
+sent:      { "projectId": { "gt": "" } }           // comparison swap
+sent:      { "organizationId": { "in": [...] } }   // widen to many
+```
+
+The query stays perfectly parameterised - there is no SQL injection - and yet the
+filter no longer constrains what it was meant to constrain. On a target whose only
+authorization layer is these same procedures, a filter that stops filtering **is**
+a cross-organisation read.
+
+**SQLI-ORM1.** For every tRPC procedure and Server Action that takes an id or a
+filter, resend it with the scalar replaced by:
+`{"not":""}`, `{"gt":""}`, `{"gte":""}`, `{"contains":""}`, `{"in":[]}`,
+`{"notIn":[]}`, `{"startsWith":""}`, `{"mode":"insensitive"}`, `null`, `[]`,
+`true`, and an array of two ids from different organisations.
+
+**SQLI-ORM2.** Type juggling: send a number where a string id is expected and vice
+versa, and send an array where a scalar is expected. Zod will reject a mismatched
+type if the procedure validates its input - and the *absence* of a validation error
+tells you the procedure does not validate, which is worth knowing on its own.
+
+**SQLI-ORM3.** Extra keys. Add fields the procedure does not expect
+(`organizationId`, `userId`, `role`) to its input object and see whether they are
+passed through into the query or the write. This is the read-side sibling of the
+mass-assignment test in 22.2.
+
+Of everything in this section, **ORM operator injection is the item worth your
+time.** It fits this architecture, it needs no raw SQL anywhere, and it produces
+exactly the cross-organisation outcome their programme pays most for.
